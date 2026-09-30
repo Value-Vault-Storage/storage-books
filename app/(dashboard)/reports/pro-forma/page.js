@@ -8,7 +8,7 @@ import {
 } from '@/lib/reports/proforma'
 import PrintHeader from '@/components/PrintHeader'
 import ProFormaTable from '@/components/pro-forma/ProFormaTable'
-import { ManualLineModal, RentIncreaseModal } from '@/components/pro-forma/LineItemModal'
+import { ManualLineModal, RentIncreaseModal, LineMethodModal } from '@/components/pro-forma/LineItemModal'
 import { Segmented, KpiCard, Delta, Icon } from '@/components/pro-forma/ui'
 
 const CURRENT_YEAR = new Date().getFullYear()
@@ -34,7 +34,7 @@ export default function ProFormaPage() {
   const [year, setYear] = useState(CURRENT_YEAR + 1)
   const [facility, setFacility] = useState('all')
   const [view, setView] = useState('monthly')
-  const [modal, setModal] = useState(null) // { kind: 'manual' | 'rent', initial }
+  const [modal, setModal] = useState(null) // { kind: 'manual' | 'rent' | 'method', initial }
 
   const saveTimers = useRef({})
   const supabase = createClient()
@@ -149,6 +149,17 @@ export default function ProFormaPage() {
 
   function deleteRentIncrease(id) {
     updateAssumptions(a => ({ ...a, rentIncreases: a.rentIncreases.filter(r => r.id !== id) }))
+    setModal(null)
+  }
+
+  // cfg null → back to the trailing average
+  function setLineMethod(name, cfg) {
+    updateAssumptions(a => {
+      const lineMethods = { ...(a.lineMethods || {}) }
+      if (cfg) lineMethods[name] = cfg
+      else delete lineMethods[name]
+      return { ...a, lineMethods }
+    })
     setModal(null)
   }
 
@@ -288,7 +299,7 @@ export default function ProFormaPage() {
           : <>
               Baseline averages {pf.window.label} ({pf.window.count} month{pf.window.count === 1 ? '' : 's'})
               {pf.window.limitedByOperating && ` — ${facilityName} has only ${pf.window.count} operating month${pf.window.count === 1 ? '' : 's'} of history`}
-              . CapEx, one-time, and add-back transactions are excluded. Click a category to see vendors; click any month to edit it.
+              . CapEx, one-time, and add-back transactions are excluded. Click a category to see vendors; hover it to switch to an annual or fixed amount; click any month to edit it.
             </>}
       </p>
 
@@ -310,6 +321,7 @@ export default function ProFormaPage() {
           onExcludeCategory={name => setCategoryExcluded(name, true)}
           onToggleVendor={toggleVendor}
           onEditRow={editRow}
+          onEditMethod={row => setModal({ kind: 'method', initial: row })}
           onAdd={kind => setModal(kind === 'rent'
             ? { kind: 'rent', initial: null }
             : { kind: 'manual', initial: { type: kind } })}
@@ -351,6 +363,10 @@ export default function ProFormaPage() {
 
       {modal?.kind === 'manual' && (
         <ManualLineModal initial={modal.initial} onSave={saveManualLine} onDelete={deleteManualLine} onClose={() => setModal(null)} />
+      )}
+      {modal?.kind === 'method' && (
+        <LineMethodModal row={modal.initial} windowLabel={pf.window ? `${pf.window.label} (${pf.window.count} mo)` : 'the trailing window'}
+          onSave={cfg => setLineMethod(modal.initial.name, cfg)} onClose={() => setModal(null)} />
       )}
       {modal?.kind === 'rent' && (
         <RentIncreaseModal initial={modal.initial} onSave={saveRentIncrease} onDelete={deleteRentIncrease} onClose={() => setModal(null)} />
