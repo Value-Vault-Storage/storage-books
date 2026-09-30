@@ -222,3 +222,20 @@ create policy "report_assets_insert" on storage.objects
   for insert with check (bucket_id = 'report-assets');
 create policy "report_assets_update" on storage.objects
   for update using (bucket_id = 'report-assets');
+
+-- ── Pro Forma (next-year budget per facility) ───────────────────────────────
+-- assumptions: { baseline, rentIncreases: [...], lines: { [category]: { method, value } } }
+-- overrides:   { [category]: { [month 1-12]: amount } } — manual cell edits
+create table if not exists pro_forma (
+  id uuid primary key default gen_random_uuid(),
+  company_id uuid references companies(id) on delete cascade not null,
+  year int not null,
+  assumptions jsonb not null default '{}'::jsonb,
+  overrides jsonb not null default '{}'::jsonb,
+  updated_at timestamptz default now(),
+  unique(company_id, year)
+);
+
+alter table pro_forma enable row level security;
+create policy "authenticated read pro_forma" on pro_forma for select to authenticated using (true);
+create policy "owner write pro_forma" on pro_forma for all to authenticated using (get_my_role() = 'owner');
