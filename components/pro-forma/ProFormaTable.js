@@ -16,7 +16,7 @@ const EMPTY_MESSAGES = {
 // category expandable into vendors and then transactions.
 export default function ProFormaTable({
   pf, view, year, readOnly,
-  onOverride, onExcludeCategory, onToggleVendor, onEditRow, onAdd,
+  onOverride, onExcludeCategory, onToggleVendor, onEditRow, onEditMethod, onAdd,
 }) {
   const [expanded, setExpanded] = useState(new Set())
   const [expandedVendors, setExpandedVendors] = useState(new Set())
@@ -37,7 +37,7 @@ export default function ProFormaTable({
         <LineRow key={row.key} row={row} monthly={monthly} readOnly={readOnly} revenueTotal={t.revenueTotal}
           expandable={row.kind === 'category'} expanded={isOpen}
           onToggle={() => toggle(setExpanded, row.key)}
-          onOverride={onOverride} onExclude={onExcludeCategory} onEdit={onEditRow} />,
+          onOverride={onOverride} onExclude={onExcludeCategory} onEdit={onEditRow} onEditMethod={onEditMethod} />,
         ...(isOpen ? row.vendors.flatMap(v => {
           const vKey = `${row.key}|${v.key}`
           const vOpen = expandedVendors.has(vKey)
@@ -168,8 +168,9 @@ function pctOf(value, total) {
   return `${(value / total * 100).toFixed(1)}%`
 }
 
-function LineRow({ row, monthly, readOnly, revenueTotal, expandable, expanded, onToggle, onOverride, onExclude, onEdit }) {
-  const badge = row.kind === 'rent' ? 'Rent' : row.kind === 'manual' ? 'Manual' : null
+function LineRow({ row, monthly, readOnly, revenueTotal, expandable, expanded, onToggle, onOverride, onExclude, onEdit, onEditMethod }) {
+  const badge = row.kind === 'rent' ? 'Rent' : row.kind === 'manual' ? 'Manual'
+    : row.method === 'annual' ? 'Annual' : row.method === 'fixed' ? 'Fixed' : null
   const cellsEditable = !readOnly && row.kind !== 'rent'
   return (
     <tr className="group">
@@ -187,12 +188,17 @@ function LineRow({ row, monthly, readOnly, revenueTotal, expandable, expanded, o
           </button>
           {badge && (
             <span className={`shrink-0 rounded px-1.5 py-px text-[10px] font-semibold uppercase tracking-wide ${
-              row.kind === 'rent' ? 'bg-emerald-50 text-emerald-700' : 'bg-indigo-50 text-indigo-700'
+              row.kind === 'rent' ? 'bg-emerald-50 text-emerald-700'
+                : row.kind === 'manual' ? 'bg-indigo-50 text-indigo-700'
+                : 'bg-sky-50 text-sky-700'
             }`}>{badge}</span>
           )}
-          {row.detail && <span className="shrink-0 text-xs text-slate-400 truncate">{row.detail}</span>}
+          {row.detail && (row.kind === 'category' && !readOnly
+            ? <button type="button" onClick={() => onEditMethod(row)} className="shrink-0 text-xs text-slate-400 truncate hover:text-slate-700 hover:underline">{row.detail}</button>
+            : <span className="shrink-0 text-xs text-slate-400 truncate">{row.detail}</span>)}
           {!readOnly && (
             <RowActions>
+              {row.kind === 'category' && <ActionButton icon="sliders" label="Forecast method (average, annual, fixed)" onClick={() => onEditMethod(row)} />}
               {row.kind === 'category' && <ActionButton icon="eyeOff" label="Exclude from forecast" onClick={() => onExclude(row.name)} />}
               {row.kind !== 'category' && <ActionButton icon="pencil" label="Edit" onClick={() => onEdit(row)} />}
             </RowActions>
