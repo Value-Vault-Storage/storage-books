@@ -3,7 +3,14 @@ import { useState } from 'react'
 import { MONTHS, RENT_INCREASE_TYPES } from '@/lib/reports/proforma'
 import { Modal, Field, NumberInput, MonthPicker, Segmented, inputCls } from '@/components/pro-forma/ui'
 
-// Add / edit a manual revenue or expense line
+const SECTION_LABELS = { income: 'Revenue', expense: 'Expense', debt: 'Debt service' }
+const PLACEHOLDERS = {
+  income: 'e.g. Tenant insurance program',
+  expense: 'e.g. Property tax',
+  debt: 'e.g. Loan interest',
+}
+
+// Add / edit a manual revenue, expense, or debt service line
 export function ManualLineModal({ initial, onSave, onDelete, onClose }) {
   const [line, setLine] = useState(() => ({
     id: crypto.randomUUID(),
@@ -23,8 +30,10 @@ export function ManualLineModal({ initial, onSave, onDelete, onClose }) {
 
   return (
     <Modal
-      title={isNew ? `Add ${line.type === 'income' ? 'revenue' : 'expense'} line` : 'Edit line'}
-      subtitle="Manual lines are added on top of the trailing averages."
+      title={isNew ? `Add ${SECTION_LABELS[line.type].toLowerCase()} line` : 'Edit line'}
+      subtitle={line.type === 'debt'
+        ? 'Debt service is reported below NOI and reduces cash flow, not NOI.'
+        : 'Manual lines are added on top of the trailing averages.'}
       onClose={onClose}
       footer={
         <>
@@ -47,11 +56,11 @@ export function ManualLineModal({ initial, onSave, onDelete, onClose }) {
     >
       <Field label="Name">
         <input autoFocus value={line.name} onChange={e => set({ name: e.target.value })}
-          placeholder={line.type === 'income' ? 'e.g. Tenant insurance program' : 'e.g. Property tax'} className={inputCls} />
+          placeholder={PLACEHOLDERS[line.type]} className={inputCls} />
       </Field>
       <Field label="Section">
         <Segmented size="sm" value={line.type} onChange={type => set({ type })}
-          options={[{ value: 'income', label: 'Revenue' }, { value: 'expense', label: 'Expense' }]} />
+          options={Object.entries(SECTION_LABELS).map(([value, label]) => ({ value, label }))} />
       </Field>
       <Field label="Timing">
         <Segmented size="sm" value={line.frequency} onChange={frequency => set({ frequency })}

@@ -271,9 +271,16 @@ export default function ProFormaPage() {
         <KpiCard label="Operating Expenses" value={formatWhole(t.expenseTotal)}
           sub={<><Delta current={t.expenseTotal} previous={trailingExpenseRun} invert /> vs {formatWhole(trailingExpenseRun)} trailing run-rate</>} />
         <KpiCard label="Net Operating Income" value={formatWhole(t.noiTotal)} tone={t.noiTotal < 0 ? 'negative' : 'default'}
-          sub={<><Delta current={t.noiTotal} previous={trailingNOIRun} /> vs {formatWhole(trailingNOIRun)} trailing run-rate</>} />
-        <KpiCard label="NOI Margin" value={t.revenueTotal ? `${(t.noiTotal / t.revenueTotal * 100).toFixed(1)}%` : '–'}
-          sub={t.revenueTotal ? `Expense ratio ${(t.expenseTotal / t.revenueTotal * 100).toFixed(1)}%` : null} />
+          sub={t.debtServiceTotal > 0 && t.revenueTotal
+            ? <><Delta current={t.noiTotal} previous={trailingNOIRun} /> vs trailing · {(t.noiTotal / t.revenueTotal * 100).toFixed(1)}% margin</>
+            : <><Delta current={t.noiTotal} previous={trailingNOIRun} /> vs {formatWhole(trailingNOIRun)} trailing run-rate</>} />
+        {t.debtServiceTotal > 0 ? (
+          <KpiCard label="Cash Flow After Debt Service" value={formatWhole(t.cashFlowTotal)} tone={t.cashFlowTotal < 0 ? 'negative' : 'default'}
+            sub={<>DSCR <span className="font-medium text-slate-700">{(t.noiTotal / t.debtServiceTotal).toFixed(2)}x</span> on {formatWhole(t.debtServiceTotal)} debt service</>} />
+        ) : (
+          <KpiCard label="NOI Margin" value={t.revenueTotal ? `${(t.noiTotal / t.revenueTotal * 100).toFixed(1)}%` : '–'}
+            sub={t.revenueTotal ? `Expense ratio ${(t.expenseTotal / t.revenueTotal * 100).toFixed(1)}%` : null} />
+        )}
       </div>
       <p className="print-hide text-xs text-slate-500 mb-6">
         {isConsolidated

@@ -6,6 +6,11 @@ import { Icon } from '@/components/pro-forma/ui'
 const num = 'px-3 py-2 text-right tabular-nums whitespace-nowrap'
 const stickyCol = 'sticky left-0 z-10'
 const TX_PREVIEW = 8
+const EMPTY_MESSAGES = {
+  income: 'No revenue in the averaging window.',
+  expense: 'No expenses in the averaging window.',
+  debt: 'No debt service. Add loan interest and principal payments here.',
+}
 
 // The pro forma statement: revenue and operating expense sections, each
 // category expandable into vendors and then transactions.
@@ -46,7 +51,7 @@ export default function ProFormaTable({
       ]
     }).flat().filter(Boolean).concat(
       rows.length === 0
-        ? [<tr key={`${type}-empty`}><td colSpan={colCount} className="px-5 py-3 text-sm text-slate-400">No {type === 'income' ? 'revenue' : 'expenses'} in the averaging window.</td></tr>]
+        ? [<tr key={`${type}-empty`}><td colSpan={colCount} className="px-5 py-3 text-sm text-slate-400">{EMPTY_MESSAGES[type]}</td></tr>]
         : []
     )
   }
@@ -98,6 +103,25 @@ export default function ProFormaTable({
           <TotalRow label="Net Operating Income" values={t.noi} total={t.noiTotal}
             avg={t.trailingRevenueAvg - t.trailingExpenseAvg} monthly={monthly} revenueTotal={t.revenueTotal} emphasis />
           <MarginRow t={t} monthly={monthly} />
+
+          {(pf.debt.length > 0 || !readOnly) && (
+            <>
+              <SectionHeader label="Debt Service" colCount={colCount} />
+              {section(pf.debt, 'debt')}
+              {!readOnly && (
+                <AddRow colCount={colCount} actions={[{ label: 'Add debt service line', onClick: () => onAdd('debt') }]} />
+              )}
+            </>
+          )}
+          {pf.debt.length > 0 && (
+            <>
+              <TotalRow label="Total Debt Service" values={t.debtService} total={t.debtServiceTotal} avg={t.trailingDebtAvg || null}
+                monthly={monthly} revenueTotal={t.revenueTotal} />
+              <TotalRow label="Cash Flow After Debt Service" values={t.cashFlow} total={t.cashFlowTotal}
+                avg={null} monthly={monthly} revenueTotal={t.revenueTotal} emphasis />
+              <DscrRow t={t} monthly={monthly} />
+            </>
+          )}
         </tbody>
       </table>
     </div>
@@ -294,13 +318,13 @@ function TotalRow({ label, values, total, avg, monthly, revenueTotal, emphasis }
       <td className={`${stickyCol} ${bg} ${border} px-5 py-2.5`}>{label}</td>
       {monthly ? (
         <>
-          <td className={`${num} ${border} py-2.5 font-normal ${emphasis ? 'text-slate-400' : 'text-slate-400'}`}>{formatAccounting(avg)}</td>
+          <td className={`${num} ${border} py-2.5 font-normal text-slate-400`}>{avg === null ? '' : formatAccounting(avg)}</td>
           {values.map((v, i) => <td key={i} className={`${num} ${border} py-2.5 ${neg(v)}`}>{formatAccounting(v)}</td>)}
           <td className={`${num} ${border} py-2.5 ${neg(total)}`}>{formatAccounting(total, { dollar: true })}</td>
         </>
       ) : (
         <>
-          <td className={`${num} ${border} py-2.5 font-normal text-slate-400`}>{formatAccounting(avg)}</td>
+          <td className={`${num} ${border} py-2.5 font-normal text-slate-400`}>{avg === null ? '' : formatAccounting(avg)}</td>
           <td className={`${num} ${border} py-2.5 ${neg(total)}`}>{formatAccounting(total / 12)}</td>
           <td className={`${num} ${border} py-2.5 ${neg(total)}`}>{formatAccounting(total, { dollar: true })}</td>
           <td className={`${num} ${border} py-2.5 font-normal ${emphasis ? 'text-slate-300' : 'text-slate-500'}`}>{pctOf(total, revenueTotal)}</td>
@@ -327,6 +351,32 @@ function MarginRow({ t, monthly }) {
           <td className={cell}>{margin(t.trailingRevenueAvg - t.trailingExpenseAvg, t.trailingRevenueAvg)}</td>
           <td className={cell}>{margin(t.noiTotal, t.revenueTotal)}</td>
           <td className={`${cell} font-medium text-slate-700`}>{margin(t.noiTotal, t.revenueTotal)}</td>
+          <td className={cell} />
+        </>
+      )}
+    </tr>
+  )
+}
+
+// Debt service coverage ratio: NOI ÷ debt service
+function DscrRow({ t, monthly }) {
+  const dscr = (noi, debt) => (debt > 0 ? `${(noi / debt).toFixed(2)}x` : '–')
+  const trailingDebt = t.trailingDebtAvg
+  const cell = `${num} py-2 text-xs text-slate-500`
+  return (
+    <tr>
+      <td className={`${stickyCol} bg-white px-5 py-2 text-xs text-slate-500`} title="Net operating income ÷ debt service">DSCR</td>
+      {monthly ? (
+        <>
+          <td className={cell}>{trailingDebt > 0 ? dscr(t.trailingRevenueAvg - t.trailingExpenseAvg, trailingDebt) : ''}</td>
+          {t.noi.map((v, i) => <td key={i} className={cell}>{dscr(v, t.debtService[i])}</td>)}
+          <td className={`${cell} font-medium text-slate-700`}>{dscr(t.noiTotal, t.debtServiceTotal)}</td>
+        </>
+      ) : (
+        <>
+          <td className={cell}>{trailingDebt > 0 ? dscr(t.trailingRevenueAvg - t.trailingExpenseAvg, trailingDebt) : ''}</td>
+          <td className={cell}>{dscr(t.noiTotal, t.debtServiceTotal)}</td>
+          <td className={`${cell} font-medium text-slate-700`}>{dscr(t.noiTotal, t.debtServiceTotal)}</td>
           <td className={cell} />
         </>
       )}
