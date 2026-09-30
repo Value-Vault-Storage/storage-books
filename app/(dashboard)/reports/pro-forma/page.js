@@ -27,6 +27,7 @@ export default function ProFormaPage() {
   const [categories, setCategories] = useState([])
   const [reportSettings, setReportSettings] = useState({})
   const [plans, setPlans] = useState({}) // planKey → { assumptions, overrides }
+  const [bankPLCats, setBankPLCats] = useState([]) // default operating categories
   const [loading, setLoading] = useState(true)
   const [tableMissing, setTableMissing] = useState(false)
   const [saveStatus, setSaveStatus] = useState(null) // null | 'saving' | 'saved' | 'error'
@@ -42,16 +43,18 @@ export default function ProFormaPage() {
 
   async function loadAll() {
     setLoading(true)
-    const [tx, { data: co }, { data: cat }, { data: branding }, { data: pf, error: pfError }] = await Promise.all([
+    const [tx, { data: co }, { data: cat }, { data: branding }, { data: pf, error: pfError }, { data: bpl }] = await Promise.all([
       fetchAllRows(() => supabase.from('transactions').select('*, categories(name, type)').order('date')),
       supabase.from('companies').select('*').order('name'),
       supabase.from('categories').select('*').order('sort_order'),
       supabase.from('report_settings').select('*'),
       supabase.from('pro_forma').select('*'),
+      supabase.from('bank_pl_categories').select('company_id, category_id'),
     ])
     setTransactions(tx)
     setCompanies(co || [])
     setCategories(cat || [])
+    setBankPLCats(bpl || [])
     if (branding) setReportSettings(Object.fromEntries(branding.map(r => [r.key, r.value])))
     if (pfError) {
       console.error('pro_forma:', pfError.message)
@@ -133,11 +136,19 @@ export default function ProFormaPage() {
   if (loading) return <div className="p-8 text-slate-400 text-sm">Loading...</div>
 
   // ── Compute ──────────────────────────────────────────────────────
+  // Default operating categories: the facility's Bank P&L selection, else the portfolio's
+  const includedFor = companyId => {
+    const own = bankPLCats.filter(r => r.company_id === companyId)
+    const rows = own.length ? own : bankPLCats.filter(r => r.company_id === null)
+    const catName = Object.fromEntries(categories.map(c => [c.id, c.name]))
+    return new Set(rows.map(r => catName[r.category_id]).filter(Boolean))
+  }
   const forecastFor = companyId => {
     const plan = getPlan(companyId)
     return computeProForma({
       transactions, categories, companyId,
       assumptions: plan.assumptions, overrides: plan.overrides,
+      includedCategories: includedFor(companyId),
     })
   }
   const isConsolidated = facility === 'all'
@@ -338,7 +349,10 @@ function AssumptionsPanel({ plan, pf, categories, onAddRent, onUpdateRent, onRem
         <div className="px-4 py-3 border-b border-slate-100 bg-slate-50 flex items-center justify-between gap-3">
           <div>
             <h2 className="text-sm font-semibold text-slate-900">Line Item Drivers</h2>
-            <p className="text-xs text-slate-500 mt-0.5">How each category is projected before manual edits</p>
+            <p className="text-xs text-slate-500 mt-0.5">
+              How each category is projected before manual edits. Defaults follow your Bank P&L category selection.
+              {pf.operatingMonths < 12 && ` Averages use the ${pf.operatingMonths} operating month${pf.operatingMonths === 1 ? '' : 's'} in the trailing window.`}
+            </p>
           </div>
           {addable.length > 0 && (
             <select value="" onChange={e => e.target.value && onSetLine(e.target.value, { method: 'fixed', value: 0 })}
