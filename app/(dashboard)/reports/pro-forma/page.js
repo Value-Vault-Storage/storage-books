@@ -391,7 +391,7 @@ function AssumptionsPanel({ plan, pf, categories, onAddRent, onUpdateRent, onRem
                       </td>
                       <td className="px-4 py-1.5 text-right font-mono text-slate-500">{formatWhole(line.ttmAvg)}</td>
                       <td className="px-4 py-1.5">
-                        <select value={line.method} onChange={e => onSetLine(line.name, { method: e.target.value, value: 0 })}
+                        <select value={line.method} onChange={e => onSetLine(line.name, driverDefaults(e.target.value, line, pf.ttmMonths))}
                           className="border border-slate-200 rounded-md px-2 py-1 text-xs">
                           {methods.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
                         </select>
@@ -400,6 +400,9 @@ function AssumptionsPanel({ plan, pf, categories, onAddRent, onUpdateRent, onRem
                         {unit && (
                           <NumberInput value={line.value} onChange={v => onSetLine(line.name, { value: v })}
                             prefix={unit === '$' ? '$' : null} suffix={unit === '%' ? '%' : null} small />
+                        )}
+                        {line.method === 'scheduled' && (
+                          <MonthPicker months={line.months} onChange={months => onSetLine(line.name, { months })} />
                         )}
                       </td>
                       <td className={`px-4 py-1.5 text-right font-mono ${excluded ? 'text-slate-300' : type === 'income' ? 'text-emerald-600' : 'text-red-500'}`}>
@@ -413,6 +416,41 @@ function AssumptionsPanel({ plan, pf, categories, onAddRent, onUpdateRent, onRem
           </table>
         </div>
       </div>
+    </div>
+  )
+}
+
+// Starting values when a line switches driver method. For 'scheduled', seed the
+// annual amount and payment months from what was actually paid in the trailing window.
+function driverDefaults(method, line, ttmMonths) {
+  if (method !== 'scheduled') return { method, value: 0 }
+  const paidMonths = ttmMonths.filter((_, i) => line.actual[i] > 0).map(m => m.month)
+  return {
+    method,
+    value: line.ttmTotal > 0 ? Math.round(line.ttmTotal) : 0,
+    months: paidMonths.length > 0 && paidMonths.length <= 4 ? [...new Set(paidMonths)].sort((a, b) => a - b) : [],
+  }
+}
+
+// Compact 12-month toggle row for choosing when a scheduled amount is paid
+function MonthPicker({ months, onChange }) {
+  const selected = new Set(months)
+  function toggle(m) {
+    const next = new Set(selected)
+    next.has(m) ? next.delete(m) : next.add(m)
+    onChange([...next].sort((a, b) => a - b))
+  }
+  return (
+    <div className="mt-1">
+      <div className="flex gap-0.5">
+        {MONTHS.map((label, i) => (
+          <button key={label} type="button" onClick={() => toggle(i + 1)} title={label}
+            className={`w-5 h-5 rounded text-[10px] font-medium ${selected.has(i + 1) ? 'bg-slate-900 text-white' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}>
+            {label[0]}
+          </button>
+        ))}
+      </div>
+      {selected.size === 0 && <p className="text-[10px] text-amber-600 mt-0.5">Pick payment month(s)</p>}
     </div>
   )
 }
