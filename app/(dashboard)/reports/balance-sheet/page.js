@@ -3,6 +3,21 @@ import { useState, useEffect, useRef } from 'react'
 import { createClient } from '@/utils/supabase/client'
 import { formatCurrency } from '@/lib/reports/pl'
 import PrintHeader from '@/components/PrintHeader'
+import ExportCsvButton from '@/components/ExportCsvButton'
+import { money, csvFilename } from '@/lib/exportCsv'
+
+// CSV rows for a balance sheet (live entries or a saved snapshot)
+function balanceSheetRows(assetRows, liabilityRows, totals) {
+  const line = section => e => [section, e.name, money(e.amount), e.notes || '']
+  return [
+    ['Section', 'Name', 'Amount', 'Notes'],
+    ...assetRows.map(line('Assets')),
+    ['Assets', 'Total Assets', money(totals.assets), ''],
+    ...liabilityRows.map(line('Liabilities')),
+    ['Liabilities', 'Total Liabilities', money(totals.liabilities), ''],
+    ['Equity', "Owner's Equity (Assets − Liabilities)", money(totals.equity), ''],
+  ]
+}
 
 export default function BalanceSheetPage() {
   const [entries, setEntries] = useState([])
@@ -133,7 +148,13 @@ export default function BalanceSheetPage() {
       <div className="p-8 max-w-2xl">
         <div className="print-hide flex items-center justify-between mb-6">
           <button onClick={() => setViewingSnapshot(null)} className="text-sm text-slate-500 hover:text-slate-800">← Back</button>
-          <button onClick={() => window.print()} className="px-4 py-2 text-sm border border-slate-200 rounded-lg text-slate-600 hover:bg-slate-50">Print / Save PDF</button>
+          <div className="flex gap-2">
+            <ExportCsvButton
+              filename={() => csvFilename('balance-sheet', snap.label, snap.as_of_date)}
+              getRows={() => balanceSheetRows(snapAssets, snapLiabilities, { assets: snap.total_assets, liabilities: snap.total_liabilities, equity: snap.total_equity })}
+            />
+            <button onClick={() => window.print()} className="px-4 py-2 text-sm border border-slate-200 rounded-lg text-slate-600 hover:bg-slate-50">Print / Save PDF</button>
+          </div>
         </div>
         <div className="print-area bg-white rounded-xl border border-slate-200 overflow-hidden">
           <PrintHeader
@@ -190,8 +211,12 @@ export default function BalanceSheetPage() {
               Save Snapshot
             </button>
           )}
+          <ExportCsvButton
+            filename={() => csvFilename('balance-sheet', companyFilter === 'all' ? 'all-entities' : companies.find(c => c.id === companyFilter)?.name, asOfDate)}
+            getRows={() => balanceSheetRows(assets, liabilities, { assets: totalAssets, liabilities: totalLiabilities, equity: totalEquity })}
+          />
           <button onClick={() => window.print()} className="px-4 py-2 text-sm border border-slate-200 rounded-lg text-slate-600 hover:bg-slate-50">
-            Print / Export
+            Print / PDF
           </button>
         </div>
       </div>

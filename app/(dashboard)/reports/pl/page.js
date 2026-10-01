@@ -4,6 +4,8 @@ import { createClient } from '@/utils/supabase/client'
 import { filterTransactions, buildPL, formatCurrency } from '@/lib/reports/pl'
 import { fetchAllRows } from '@/lib/fetchAll'
 import PrintHeader from '@/components/PrintHeader'
+import ExportCsvButton from '@/components/ExportCsvButton'
+import { plRows, csvFilename } from '@/lib/exportCsv'
 
 const CURRENT_YEAR = new Date().getFullYear()
 const YEARS = [CURRENT_YEAR, CURRENT_YEAR - 1, CURRENT_YEAR - 2]
@@ -209,6 +211,22 @@ export default function PLPage() {
   const incomeCategories = categories.filter(c => c.type === 'income')
   const expenseCategories = categories.filter(c => c.type === 'expense')
 
+  // CSV export mirrors whichever statement is on screen
+  const entityName = mode === 'bank_pl'
+    ? (bankEntity === 'portfolio' ? 'Portfolio' : companies.find(c => c.id === bankEntity)?.name)
+    : (companyFilter === 'all' ? 'Consolidated' : companies.find(c => c.id === companyFilter)?.name)
+  function csvRows() {
+    if (mode === 'bank_pl') return plRows([{ label: entityName, pl: bankPL }])
+    if (showByCompany && byCompany) return plRows(byCompany.map(({ company, pl: coPL }) => ({ label: company.name, pl: coPL })))
+    if (view === 'monthly' && monthlyData) {
+      return plRows(Object.entries(monthlyData).map(([key, monthPL]) => ({
+        label: `${MONTHS[parseInt(key.split('-')[1]) - 1]} ${year}`,
+        pl: monthPL,
+      })))
+    }
+    return plRows([{ label: entityName, pl }])
+  }
+
   if (loading) return <div className="p-8 text-slate-400 text-sm">Loading...</div>
 
   return (
@@ -218,12 +236,18 @@ export default function PLPage() {
           <h1 className="text-xl font-bold text-slate-900">P&L Statement</h1>
           <p className="text-sm text-slate-500 mt-0.5">{modeLabel[mode]}</p>
         </div>
-        <button
-          onClick={() => window.print()}
-          className="px-4 py-2 text-sm border border-slate-200 rounded-lg text-slate-600 hover:bg-slate-50"
-        >
-          Print / Export
-        </button>
+        <div className="flex gap-2">
+          <ExportCsvButton
+            filename={() => csvFilename(mode === 'bank_pl' ? 'bank-pl' : 'pl', entityName, year, MONTHS[monthFrom - 1], MONTHS[monthTo - 1])}
+            getRows={csvRows}
+          />
+          <button
+            onClick={() => window.print()}
+            className="px-4 py-2 text-sm border border-slate-200 rounded-lg text-slate-600 hover:bg-slate-50"
+          >
+            Print / PDF
+          </button>
+        </div>
       </div>
 
       {/* Controls */}

@@ -3,6 +3,8 @@ import { useState, useEffect } from 'react'
 import { createClient } from '@/utils/supabase/client'
 import { filterTransactions, buildPL, formatCurrency } from '@/lib/reports/pl'
 import { fetchAllRows } from '@/lib/fetchAll'
+import ExportCsvButton from '@/components/ExportCsvButton'
+import { plRows, csvFilename } from '@/lib/exportCsv'
 
 const CURRENT_YEAR = new Date().getFullYear()
 const CURRENT_MONTH = new Date().getMonth() + 1
@@ -111,9 +113,18 @@ export default function EntityComparisonPage() {
 
   return (
     <div className="p-8 max-w-6xl">
-      <div className="mb-6">
-        <h1 className="text-xl font-bold text-slate-900">Entity Comparison</h1>
-        <p className="text-slate-500 text-sm mt-0.5">Side-by-side P&L across all entities</p>
+      <div className="flex items-center justify-between mb-6">
+        <div>
+          <h1 className="text-xl font-bold text-slate-900">Entity Comparison</h1>
+          <p className="text-slate-500 text-sm mt-0.5">Side-by-side P&L across all entities</p>
+        </div>
+        <ExportCsvButton
+          filename={() => csvFilename('entity-comparison', year, MONTHS[monthFrom - 1], MONTHS[monthTo - 1])}
+          getRows={() => plRows(
+            [...entityPLs.map(e => ({ label: e.company.name, pl: e.pl })), { label: 'Portfolio', pl: portfolioPL }],
+            { total: false }
+          )}
+        />
       </div>
 
       {/* Filter bar */}

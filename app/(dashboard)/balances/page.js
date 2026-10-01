@@ -3,6 +3,8 @@ import { useState, useEffect } from 'react'
 import { createClient } from '@/utils/supabase/client'
 import { formatCurrency } from '@/lib/reports/pl'
 import { fetchAllRows } from '@/lib/fetchAll'
+import ExportCsvButton from '@/components/ExportCsvButton'
+import { money, csvFilename } from '@/lib/exportCsv'
 
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
 const CURRENT_YEAR = new Date().getFullYear()
@@ -309,6 +311,31 @@ export default function BalancesPage() {
   // ── Portfolio view data ───────────────────────────────────────────
   const portfolioRows = buildPortfolioSections()
 
+  // CSV export: portfolio reconciliation by entity, or one entity's accounts by month
+  function csvRows() {
+    const status = (variance, tied) => (variance === null ? '' : tied ? 'Tied' : 'Variance')
+    if (isPortfolio) {
+      return [
+        ['Month', ...companies.map(c => c.name), 'Portfolio Total', 'Net Transactions', 'Expected', 'Variance', 'Status'],
+        ...portfolioRows.map(r => [
+          r.label,
+          ...r.entityCells.map(c => money(c.row.monthTotal)),
+          money(r.portfolioTotal), money(r.portfolioNet), money(r.portfolioExpected), money(r.portfolioVariance),
+          status(r.portfolioVariance, r.portfolioTied),
+        ]),
+      ]
+    }
+    return [
+      ['Month', ...entityAccounts.map(a => (a.last_four ? `${a.name} (${a.last_four})` : a.name)), 'Net Transactions', 'Expected', 'Statement Total', 'Variance', 'Status'],
+      ...sections.map(s => [
+        s.label,
+        ...entityAccounts.map(a => money(getSavedBalance(a.id, s.rowYear, s.rowMonth))),
+        money(s.net), money(s.expected), money(s.monthTotal), money(s.variance),
+        status(s.variance, s.isTied),
+      ]),
+    ]
+  }
+
   if (loading) return <div className="p-8 text-slate-400 text-sm">Loading...</div>
 
   return (
@@ -324,6 +351,10 @@ export default function BalancesPage() {
           <h1 className="text-xl font-bold text-slate-900">Monthly Balances</h1>
           <p className="text-slate-500 text-sm mt-0.5">Enter statement balances to reconcile against imported transactions</p>
         </div>
+        <ExportCsvButton
+          filename={() => csvFilename('monthly-balances', isPortfolio ? 'portfolio' : selectedCompany?.name, year)}
+          getRows={csvRows}
+        />
       </div>
 
       {/* Filter bar */}

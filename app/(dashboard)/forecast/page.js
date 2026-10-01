@@ -3,6 +3,8 @@ import { useState, useEffect, useCallback, Fragment } from 'react'
 import { createClient } from '@/utils/supabase/client'
 import { filterTransactions, buildPL, formatCurrency } from '@/lib/reports/pl'
 import { fetchAllRows } from '@/lib/fetchAll'
+import ExportCsvButton from '@/components/ExportCsvButton'
+import { money, csvFilename } from '@/lib/exportCsv'
 
 const CURRENT_YEAR = new Date().getFullYear()
 const CURRENT_MONTH = new Date().getMonth() + 1
@@ -324,6 +326,28 @@ export default function ForecastPage() {
     await loadAll()
   }
 
+  // CSV export: the month-by-month table, then the upcoming one-time items
+  function csvRows() {
+    return [
+      ['Month', 'Type', 'Income', 'Expenses', 'Net', 'One-Time Items', 'Cash Balance'],
+      ...allRows.map(row => [
+        monthLabel(row.year, row.month),
+        row.isActual ? 'Actual' : 'Forecast',
+        money(row.isActual ? row.income : row.avgIncome),
+        money(row.isActual ? row.expenses : row.avgExpenses),
+        money(row.net),
+        money(row.itemsTotal),
+        money(row.balance),
+      ]),
+      [],
+      ['Upcoming Items'],
+      ['Date', 'Description', 'Entity', 'Notes', 'Amount'],
+      ...forecastItems.map(item => [
+        item.due_date, item.description, item.companies?.name || 'All Entities', item.notes || '', money(parseFloat(item.amount)),
+      ]),
+    ]
+  }
+
   if (loading) return <div className="p-8 text-slate-400 text-sm">Loading...</div>
 
   const incomeExcludedCount = incomeBreakdown.filter(x => excludedCatIds.has(x.catId)).length
@@ -338,12 +362,15 @@ export default function ForecastPage() {
             {monthLabel(CURRENT_YEAR, CURRENT_MONTH)} → Dec {CURRENT_YEAR} · {baselineLabel}
           </p>
         </div>
-        <button
-          onClick={() => setShowAdd(true)}
-          className="px-4 py-2 text-sm bg-slate-900 text-white rounded-lg hover:bg-slate-700 font-medium"
-        >
-          + Add Upcoming Item
-        </button>
+        <div className="flex gap-2">
+          <ExportCsvButton filename={() => csvFilename('cash-flow-forecast', CURRENT_YEAR)} getRows={csvRows} />
+          <button
+            onClick={() => setShowAdd(true)}
+            className="px-4 py-2 text-sm bg-slate-900 text-white rounded-lg hover:bg-slate-700 font-medium"
+          >
+            + Add Upcoming Item
+          </button>
+        </div>
       </div>
 
       {/* Starting cash banner */}

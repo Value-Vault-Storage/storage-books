@@ -3,6 +3,8 @@ import { useState, useEffect, useCallback } from 'react'
 import { createClient } from '@/utils/supabase/client'
 import { buildPL, formatCurrency } from '@/lib/reports/pl'
 import { fetchAllRows } from '@/lib/fetchAll'
+import ExportCsvButton from '@/components/ExportCsvButton'
+import { plRows, money, pct, csvFilename } from '@/lib/exportCsv'
 
 const CURRENT_YEAR = new Date().getFullYear()
 const YEARS = [CURRENT_YEAR, CURRENT_YEAR - 1, CURRENT_YEAR - 2]
@@ -90,6 +92,19 @@ export default function DealRoomPage() {
   const impliedValue = capRate ? (normalizedNOI / (parseFloat(capRate) / 100)) : null
   const capRateFromValue = propertyValue ? (normalizedNOI / parseFloat(propertyValue) * 100) : null
 
+  // CSV export: the normalized P&L as shown, plus the valuation inputs
+  function csvRows() {
+    const entity = companyFilter === 'all' ? 'All Entities' : companies.find(c => c.id === companyFilter)?.name
+    const label = `${entity} ${year}${isAnnualized ? ` (annualized from ${monthsWithData} months)` : ''}`
+    const rows = plRows([{
+      label,
+      pl: { income: annIncome, expenses: annExpenses, totalIncome: annTotalIncome, totalExpenses: annTotalExpenses, noi: normalizedNOI },
+    }])
+    if (capRate) rows.push(['Cap Rate %', pct(parseFloat(capRate), 2)], ['Implied Value', money(impliedValue)])
+    if (propertyValue) rows.push(['Property Value', money(parseFloat(propertyValue))], ['Cap Rate at Value %', pct(capRateFromValue, 2)])
+    return rows
+  }
+
   if (loading) return <div className="p-8 text-slate-400 text-sm">Loading...</div>
 
   return (
@@ -99,9 +114,15 @@ export default function DealRoomPage() {
           <h1 className="text-xl font-bold text-slate-900">Deal Room</h1>
           <p className="text-slate-500 text-sm mt-0.5">Normalized P&L for bank submissions and sale underwriting</p>
         </div>
-        <button onClick={() => window.print()} className="px-4 py-2 text-sm border border-slate-200 rounded-lg text-slate-600 hover:bg-slate-50">
-          Print / Export
-        </button>
+        <div className="flex gap-2">
+          <ExportCsvButton
+            filename={() => csvFilename('deal-room', companyFilter === 'all' ? 'all-entities' : companies.find(c => c.id === companyFilter)?.name, year)}
+            getRows={csvRows}
+          />
+          <button onClick={() => window.print()} className="px-4 py-2 text-sm border border-slate-200 rounded-lg text-slate-600 hover:bg-slate-50">
+            Print / PDF
+          </button>
+        </div>
       </div>
 
       {/* Controls */}
