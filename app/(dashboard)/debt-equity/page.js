@@ -3,6 +3,8 @@ import { useState, useEffect } from 'react'
 import { createClient } from '@/utils/supabase/client'
 import { buildPL, formatCurrency } from '@/lib/reports/pl'
 import { fetchAllRows } from '@/lib/fetchAll'
+import ExportCsvButton from '@/components/ExportCsvButton'
+import { money, pct as csvPct, csvFilename } from '@/lib/exportCsv'
 
 const CURRENT_YEAR = new Date().getFullYear()
 const CURRENT_MONTH = new Date().getMonth() + 1
@@ -194,6 +196,37 @@ export default function DebtEquityPage() {
     await loadAll()
   }
 
+  // CSV export: one row per loan, then portfolio totals
+  function csvRows() {
+    const num = v => (v === null || v === undefined || v === '' ? '' : money(parseFloat(v)))
+    const rows = [[
+      'Entity', 'Lender', 'Original Balance', 'Current Balance', 'Rate %', 'Monthly Payment',
+      'Monthly Principal', 'Monthly Interest', 'Property Value', 'Equity', 'LTV %',
+      'Annual Debt Service', 'Entity DSCR', 'Maturity Date', 'Notes',
+    ]]
+    companies.forEach(company => {
+      const coLoans = loans.filter(l => l.company_id === company.id)
+      const coAnnualDebt = coLoans.reduce((s, l) => s + (parseFloat(l.monthly_payment) || 0) * 12, 0)
+      const dscr = coAnnualDebt > 0 ? Number((entityNOI(company.id) / coAnnualDebt).toFixed(2)) : ''
+      coLoans.forEach(loan => {
+        const m = loanMetrics(loan)
+        rows.push([
+          company.name, loan.lender_name, num(loan.original_balance), num(loan.current_balance),
+          loan.interest_rate ? csvPct(parseFloat(loan.interest_rate), 3) : '', num(loan.monthly_payment),
+          loan.monthly_payment ? money(m.monthlyPrincipal) : '', loan.monthly_payment ? money(m.monthlyInterest) : '',
+          num(loan.property_value), loan.property_value ? money(m.equity) : '', m.ltv === null ? '' : csvPct(m.ltv),
+          money(m.annualDebtService), dscr, loan.maturity_date || '', loan.notes || '',
+        ])
+      })
+    })
+    rows.push([
+      'Portfolio', `${loans.length} loan${loans.length !== 1 ? 's' : ''}`, '', money(portfolioDebt), '', money(portfolioMonthlyService),
+      '', '', money(portfolioValue), money(portfolioEquity), portfolioLTV === null ? '' : csvPct(portfolioLTV),
+      money(portfolioMonthlyService * 12), '', '', '',
+    ])
+    return rows
+  }
+
   if (loading) return <div className="p-8 text-slate-400 text-sm">Loading...</div>
 
   return (
@@ -203,10 +236,13 @@ export default function DebtEquityPage() {
           <h1 className="text-xl font-bold text-slate-900">Debt & Equity</h1>
           <p className="text-slate-500 text-sm mt-0.5">Loan balances, P&I breakdown, and equity position per entity</p>
         </div>
-        <button onClick={() => openAdd('')}
-          className="px-4 py-2 text-sm bg-slate-900 text-white rounded-lg hover:bg-slate-700 font-medium">
-          + Add Loan
-        </button>
+        <div className="flex gap-2">
+          <ExportCsvButton filename={() => csvFilename('debt-equity', new Date().toISOString().slice(0, 10))} getRows={csvRows} />
+          <button onClick={() => openAdd('')}
+            className="px-4 py-2 text-sm bg-slate-900 text-white rounded-lg hover:bg-slate-700 font-medium">
+            + Add Loan
+          </button>
+        </div>
       </div>
 
       {/* Portfolio summary */}

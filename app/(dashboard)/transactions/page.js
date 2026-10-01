@@ -1,6 +1,8 @@
 'use client'
 import { useState, useEffect } from 'react'
 import { createClient } from '@/utils/supabase/client'
+import ExportCsvButton from '@/components/ExportCsvButton'
+import { money, csvFilename } from '@/lib/exportCsv'
 import CommentPanel from '@/components/CommentPanel'
 import SplitModal from '@/components/SplitModal'
 import { fetchAllRows } from '@/lib/fetchAll'
@@ -199,6 +201,17 @@ export default function TransactionsPage() {
             </button>
           )}
           <span className="text-sm text-slate-500">{filtered.length} transactions</span>
+          <ExportCsvButton
+            filename={() => csvFilename('transactions', dateFrom, dateTo, new Date().toISOString().slice(0, 10))}
+            getRows={() => [
+              ['Date', 'Description', 'Entity', 'Category', 'Category Type', 'Source', 'Source Type', 'Expense Type', 'Amount', 'Notes'],
+              ...filtered.map(t => [
+                t.date, t.description || '', companies.find(c => c.id === t.company_id)?.name || '',
+                t.categories?.name || 'Uncategorized', t.categories?.type || '', t.source || '', t.source_type || '',
+                t.expense_type || '', money(t.amount), t.notes || '',
+              ]),
+            ]}
+          />
           {isOwner && (
             <button onClick={() => { setNewTx(p => ({ ...p, company_id: companies[0]?.id || '' })); setShowAddModal(true) }}
               className="bg-slate-900 text-white text-sm font-medium px-4 py-2 rounded-lg hover:bg-slate-700">

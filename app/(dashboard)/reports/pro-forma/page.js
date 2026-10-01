@@ -4,9 +4,11 @@ import { createClient } from '@/utils/supabase/client'
 import { fetchAllRows } from '@/lib/fetchAll'
 import {
   computeProForma, consolidateProFormas, normalizeAssumptions, formatWhole, formatAccounting,
-  WINDOW_OPTIONS,
+  WINDOW_OPTIONS, proFormaCsvRows,
 } from '@/lib/reports/proforma'
 import PrintHeader from '@/components/PrintHeader'
+import ExportCsvButton from '@/components/ExportCsvButton'
+import { csvFilename } from '@/lib/exportCsv'
 import ProFormaTable from '@/components/pro-forma/ProFormaTable'
 import { ManualLineModal, RentIncreaseModal, LineMethodModal } from '@/components/pro-forma/LineItemModal'
 import { Segmented, KpiCard, Delta, Icon } from '@/components/pro-forma/ui'
@@ -235,6 +237,12 @@ export default function ProFormaPage() {
               Reset {overrideCount} edit{overrideCount === 1 ? '' : 's'}
             </button>
           )}
+          <ExportCsvButton
+            filename={() => csvFilename('pro-forma', facilityName, year)}
+            getRows={() => proFormaCsvRows(pf, year)}
+            className="inline-flex items-center gap-1.5 px-3 py-2 text-sm font-medium rounded-lg border border-slate-200 bg-white text-slate-700 hover:bg-slate-50"
+            label={<><Icon name="download" className="w-4 h-4" />Export CSV</>}
+          />
           <button onClick={() => window.print()}
             className="inline-flex items-center gap-1.5 px-3 py-2 text-sm font-medium rounded-lg border border-slate-200 bg-white text-slate-700 hover:bg-slate-50">
             <Icon name="printer" className="w-4 h-4" />
