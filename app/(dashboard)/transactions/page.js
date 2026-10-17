@@ -162,7 +162,7 @@ export default function TransactionsPage() {
 
   const filtered = transactions.filter(t => {
     if (companyFilter !== 'all' && t.company_id !== companyFilter) return false
-    if (sourceFilter !== 'all' && t.source !== sourceFilter) return false
+    if (sourceFilter !== 'all' && t.source?.toLowerCase() !== sourceFilter) return false
     if (categoryFilter === '__uncategorized__') { if (t.category_id) return false }
     else if (categoryFilter !== 'all' && t.category_id !== categoryFilter) return false
     if (dateFrom && t.date < dateFrom) return false
@@ -178,6 +178,12 @@ export default function TransactionsPage() {
 
   // Sources from DB — managed in Settings
   const allSources = sources.map(s => s.name)
+
+  // Filter options come from the sources transactions actually carry (imports
+  // write e.g. 'chase'), labeled with the Settings name when one matches
+  const filterSources = [...new Set(transactions.map(t => t.source?.toLowerCase()).filter(Boolean))]
+    .map(value => ({ value, label: sources.find(s => s.name.toLowerCase() === value)?.name || value }))
+    .sort((a, b) => a.label.localeCompare(b.label))
 
   const resolvedBulkSource = bulkSource === '__custom__' ? customBulkSource.trim() : bulkSource
   const canApplyBulk = selected.size > 0 && (!!bulkCategory || !!resolvedBulkSource || !!bulkCompany)
@@ -238,7 +244,7 @@ export default function TransactionsPage() {
         <select value={sourceFilter} onChange={e => setSourceFilter(e.target.value)}
           className="border border-slate-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-slate-900">
           <option value="all">All Sources</option>
-          {allSources.map(s => <option key={s} value={s}>{s}</option>)}
+          {filterSources.map(s => <option key={s.value} value={s.value}>{s.label}</option>)}
         </select>
         <select value={categoryFilter} onChange={e => setCategoryFilter(e.target.value)}
           className="border border-slate-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-slate-900">
