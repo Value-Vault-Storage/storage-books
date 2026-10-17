@@ -80,7 +80,6 @@ export default function ImportPage() {
     setCompanies(co || [])
     setCategories(cat || [])
     setRules(rul || [])
-    if (co && co.length > 0) setCompanyId(co[0].id)
   }
 
   async function addCategory(e) {
@@ -200,6 +199,7 @@ export default function ImportPage() {
   }
 
   async function saveTransactions() {
+    if (!companyId) return
     setSaving(true)
     const toSave = rows
       .filter(r => !r.skip)
@@ -249,6 +249,7 @@ export default function ImportPage() {
   function reset() {
     setRows([])
     setStep(1)
+    setCompanyId('')
     setSavedCount(0)
     setSelected(new Set())
     setSplittingRow(null)
@@ -275,8 +276,12 @@ export default function ImportPage() {
               onChange={e => setCompanyId(e.target.value)}
               className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-900"
             >
+              <option value="" disabled>Select entity...</option>
               {companies.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
             </select>
+            {companies.length > 0 && !companyId && (
+              <p className="text-xs text-slate-400 mt-1">Choose an entity before uploading a file.</p>
+            )}
             {companies.length === 0 && (
               <p className="text-xs text-amber-600 mt-1">No companies found. Add them in Settings first.</p>
             )}
@@ -395,6 +400,7 @@ export default function ImportPage() {
           <h1 className="text-xl font-bold text-slate-900">Review Transactions</h1>
           <p className="text-slate-500 text-sm mt-0.5">
             {unskipped.length} of {rows.length} transactions from {SOURCE_LABELS[source]}
+            {' → '}<span className="font-medium text-slate-700">{companies.find(c => c.id === companyId)?.name}</span>
             {autoMatched > 0 && (
               <span className="ml-2 text-emerald-600 font-medium">· {autoMatched} auto-categorized</span>
             )}
@@ -406,7 +412,7 @@ export default function ImportPage() {
           </button>
           <button
             onClick={saveTransactions}
-            disabled={saving || unskipped.length === 0}
+            disabled={saving || unskipped.length === 0 || !companyId}
             className="px-4 py-2 text-sm bg-slate-900 text-white rounded-lg hover:bg-slate-800 disabled:opacity-50"
           >
             {saving ? 'Saving...' : `Save ${unskipped.length} transactions`}
