@@ -1,12 +1,12 @@
 'use client'
 import { useState, useEffect, useRef } from 'react'
 import Papa from 'papaparse'
+import Link from 'next/link'
 import { createClient } from '@/utils/supabase/client'
 import { parseChase } from '@/lib/parsers/chase'
 import { parseAmex } from '@/lib/parsers/amex'
 import { parseSuncoast } from '@/lib/parsers/suncoast'
 import { parseGoogleSheet } from '@/lib/parsers/googlesheet'
-import { parseEasyStorage } from '@/lib/parsers/easystorage'
 import { applyRules } from '@/lib/rules'
 import SplitModal from '@/components/SplitModal'
 import CategoryCombobox from '@/components/CategoryCombobox'
@@ -17,7 +17,6 @@ const PARSERS = {
   suncoast_checking: (rows) => parseSuncoast(rows).map(r => ({ ...r, source: 'Suncoast Checking' })),
   suncoast_savings: (rows) => parseSuncoast(rows).map(r => ({ ...r, source: 'Suncoast Savings' })),
   googlesheet: (rows, categories, sheetType) => parseGoogleSheet(rows, categories, sheetType),
-  easystorage: (rows) => parseEasyStorage(rows),
 }
 
 const SOURCE_LABELS = {
@@ -26,7 +25,6 @@ const SOURCE_LABELS = {
   suncoast_checking: 'Suncoast Checking',
   suncoast_savings: 'Suncoast Savings',
   googlesheet: 'Google Sheet',
-  easystorage: 'Easy Storage Solutions',
 }
 
 const SOURCE_DESCRIPTIONS = {
@@ -35,7 +33,6 @@ const SOURCE_DESCRIPTIONS = {
   suncoast_checking: 'Bank transactions — ties to monthly bank balance reconciliation.',
   suncoast_savings: 'Savings account transactions — ties to monthly balance.',
   googlesheet: 'Flexible import from a manually-maintained Google Sheet.',
-  easystorage: 'Revenue and tenant data from Easy Storage Solutions.',
 }
 
 export default function ImportPage() {
@@ -309,6 +306,10 @@ export default function ImportPage() {
                 </button>
               ))}
             </div>
+            <p className="text-xs text-slate-400 mt-2">
+              Easy Storage deposit reports go on <Link href="/processor-fees" className="underline hover:text-slate-600">Processor Fees</Link>.
+              Rent itself comes in with the bank statement.
+            </p>
             {source === 'googlesheet' && (
               <div className="mt-3 space-y-2">
                 <p className="text-xs text-slate-400">Export via File → Download → Comma Separated Values (.csv)</p>
