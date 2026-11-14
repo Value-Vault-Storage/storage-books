@@ -39,6 +39,16 @@ body {
     overflow: visible !important;
   }
 
+  /* P&L statement: drop the scroll box so every line prints */
+  .statement-scroll {
+    max-height: none !important;
+    overflow: visible !important;
+  }
+  .statement-scroll th,
+  .statement-scroll td {
+    position: static !important;
+  }
+
   /* Print area fills full width */
   .print-area {
     width: 100% !important;

@@ -1,133 +1,184 @@
 'use client'
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useMemo } from 'react'
+import Link from 'next/link'
 import { createClient } from '@/utils/supabase/client'
-import { filterTransactions, buildPL, formatCurrency } from '@/lib/reports/pl'
 import { fetchAllRows } from '@/lib/fetchAll'
 import PrintHeader from '@/components/PrintHeader'
 import ExportCsvButton from '@/components/ExportCsvButton'
-import { plRows, csvFilename } from '@/lib/exportCsv'
 import AdjustmentModal from '@/components/AdjustmentModal'
+import { money, pct as csvPct, csvFilename } from '@/lib/exportCsv'
 import {
-  loadAdjustments, applyAdjustments, saveAdjustments, removeAdjustments,
+  loadAdjustments, saveAdjustments, removeAdjustments,
   treatmentInfo, excludedAmount, isPartial,
 } from '@/lib/reports/adjustments'
-import Link from 'next/link'
+import {
+  classify, buildStatement, statementRows, activityTest, variance, drillItems,
+  groupNoiConfig, periodFor, priorPeriod, periodTitle, periodShort, periodRange, inPeriod,
+  monthLabel, bankTieOut, monthRuns, belowLineFor, acct, acctPct,
+} from '@/lib/reports/statement'
 
-const CURRENT_YEAR = new Date().getFullYear()
-const YEARS = [CURRENT_YEAR, CURRENT_YEAR - 1, CURRENT_YEAR - 2]
-const MONTHS = [
-  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+const PERIODS = [
+  { value: 'month', label: 'Month' },
+  { value: 'ytd', label: 'YTD' },
+  { value: 't12', label: 'T12' },
 ]
+const LAYOUTS = [
+  { value: 'compare', label: 'vs prior year' },
+  { value: 'months', label: 'By month' },
+  { value: 'entities', label: 'By entity' },
+]
+// Variance swings worse than this are highlighted
+const FLAG_AT = -0.15
+// Rows where % of EGI isn't meaningful
+const NO_PCT = new Set(['capex', 'interest', 'principal', 'cfads'])
+
+function nowKey() {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+}
 
 export default function PLPage() {
+  const supabase = createClient()
+  const [loading, setLoading] = useState(true)
   const [transactions, setTransactions] = useState([])
   const [companies, setCompanies] = useState([])
   const [categories, setCategories] = useState([])
-  const [loading, setLoading] = useState(true)
+  const [noiConfig, setNoiConfig] = useState({ cats: new Map(), portfolioCats: new Set() })
+  const [accounts, setAccounts] = useState([])
+  const [balances, setBalances] = useState([])
+  const [loans, setLoans] = useState([])
   const [reportSettings, setReportSettings] = useState({})
+  const [isOwner, setIsOwner] = useState(false)
 
-  const [companyFilter, setCompanyFilter] = useState('all')
-  const [mode, setMode] = useState('detailed') // detailed | non_detailed | full | bank_pl
-  const [year, setYear] = useState(CURRENT_YEAR)
-  const [monthFrom, setMonthFrom] = useState(1)
-  const [monthTo, setMonthTo] = useState(12)
-  const [view, setView] = useState('monthly')
-  const [showByCompany, setShowByCompany] = useState(false)
-  const [showPct, setShowPct] = useState(false)
-
-  // Bank P&L state
-  const [bankEntity, setBankEntity] = useState('portfolio')
-  const [bankIncludedCats, setBankIncludedCats] = useState(new Set())
-  const [expandedBankCats, setExpandedBankCats] = useState(new Set())
-
-  // NOI adjustments (apply in every view, not per entity)
   const [adjByTx, setAdjByTx] = useState(new Map())
   const [adjLegacy, setAdjLegacy] = useState(false)
   const [adjEditing, setAdjEditing] = useState(null) // { transactions, existing }
 
-  const supabase = createClient()
+  const [entity, setEntity] = useState('all')
+  const [periodKind, setPeriodKind] = useState('t12')
+  const [asOf, setAsOf] = useState(null)
+  const [layout, setLayout] = useState('compare')
+  const [drawer, setDrawer] = useState(null) // { title, subtitle, items }
 
   useEffect(() => { loadAll() }, [])
 
   async function loadAll() {
     setLoading(true)
-    const [tx, { data: co }, { data: cat }, { data: branding }, adj] = await Promise.all([
-      fetchAllRows(() => supabase.from('transactions').select('*, categories(name, type)').order('date')),
+    const [tx, { data: co }, { data: cat }, { data: cfg }, { data: acc }, { data: bal }, { data: lo }, { data: branding }, { data: role }, adj] = await Promise.all([
+      fetchAllRows(() => supabase.from('transactions').select('*').order('date')),
       supabase.from('companies').select('*').order('name'),
       supabase.from('categories').select('*').order('sort_order'),
+      supabase.from('bank_pl_categories').select('category_id, company_id'),
+      supabase.from('accounts').select('*'),
+      supabase.from('monthly_balances').select('*'),
+      supabase.from('loans').select('*'),
       supabase.from('report_settings').select('*'),
+      supabase.from('user_roles').select('role').maybeSingle(),
       loadAdjustments(supabase),
     ])
-    setAdjByTx(adj.byTx)
-    setAdjLegacy(adj.legacy)
-    setTransactions(tx)
+    setTransactions(tx || [])
     setCompanies(co || [])
     setCategories(cat || [])
+    setNoiConfig(groupNoiConfig(cfg))
+    setAccounts(acc || [])
+    setBalances(bal || [])
+    setLoans(lo || [])
     if (branding) setReportSettings(Object.fromEntries(branding.map(r => [r.key, r.value])))
+    setIsOwner(role?.role === 'owner')
+    setAdjByTx(adj.byTx)
+    setAdjLegacy(adj.legacy)
     setLoading(false)
   }
 
-  // Load saved Bank P&L config when entity changes
-  const loadBankConfig = useCallback(async (entityId) => {
-    const isPortfolio = entityId === 'portfolio'
-    const { data: cats } = isPortfolio
-      ? await supabase.from('bank_pl_categories').select('category_id').is('company_id', null)
-      : await supabase.from('bank_pl_categories').select('category_id').eq('company_id', entityId)
-    setBankIncludedCats(new Set((cats || []).map(c => c.category_id)))
-    setExpandedBankCats(new Set())
-  }, [])
+  // ── Periods ──────────────────────────────────────────────────────
+  // "As of" choices: months with data up to this month, newest first.
+  // Default to the latest one (this month may have nothing yet).
+  const monthOptions = useMemo(() => {
+    const now = nowKey()
+    const keys = [...new Set(transactions.map(t => t.date.slice(0, 7)))].filter(k => k <= now).sort().reverse()
+    return keys.length ? keys : [now]
+  }, [transactions])
+  const end = asOf && monthOptions.includes(asOf) ? asOf : monthOptions[0]
+  const cur = periodFor(periodKind, end)
+  const prior = priorPeriod(cur)
 
-  useEffect(() => {
-    if (mode === 'bank_pl') loadBankConfig(bankEntity)
-  }, [mode, bankEntity])
+  // ── Statement data ───────────────────────────────────────────────
+  const classified = useMemo(
+    () => classify(transactions, categories, noiConfig),
+    [transactions, categories, noiConfig],
+  )
+  const inEntity = i => entity === 'all' || i.t.company_id === entity
+  const scope = (p, companyId) => classified.filter(i =>
+    inPeriod(i.t, p) && (companyId ? i.t.company_id === companyId : inEntity(i)))
 
-  async function toggleBankCategory(categoryId) {
-    const companyId = bankEntity === 'portfolio' ? null : bankEntity
-    const cat = categories.find(c => c.id === categoryId)
+  // Months in the period that come before the books start (no data at all
+  // for this scope) don't count: a "T12" with 10 months of history is a
+  // 10-month statement, and DSCR / tie-out must say so.
+  const firstDataKey = useMemo(() => {
+    const keys = transactions.filter(t => entity === 'all' || t.company_id === entity).map(t => t.date.slice(0, 7))
+    return keys.length ? keys.reduce((a, b) => (a < b ? a : b)) : null
+  }, [transactions, entity])
+  const covered = p => (firstDataKey ? p.months.filter(k => k >= firstDataKey) : [])
+  const curCovered = covered(cur)
+  const priorCovered = covered(prior)
 
-    if (bankIncludedCats.has(categoryId)) {
-      // Remove category from Bank P&L
-      const q = companyId
-        ? supabase.from('bank_pl_categories').delete().eq('category_id', categoryId).eq('company_id', companyId)
-        : supabase.from('bank_pl_categories').delete().eq('category_id', categoryId).is('company_id', null)
-      await q
-      setBankIncludedCats(prev => { const n = new Set(prev); n.delete(categoryId); return n })
-      // Remove the opex tag from this category's transactions. NOI
-      // adjustments are kept: they document the transaction itself.
-      const txInCat = transactions.filter(t =>
-        t.category_id === categoryId &&
-        (!companyId || t.company_id === companyId) &&
-        !adjByTx.has(t.id)
-      )
-      if (txInCat.length > 0 && cat?.type === 'expense') {
-        const ids = txInCat.map(t => t.id)
-        await supabase.from('transactions').update({ expense_type: null }).in('id', ids)
-        setTransactions(prev => prev.map(t => ids.includes(t.id) ? { ...t, expense_type: null } : t))
-      }
-    } else {
-      // Add category to Bank P&L
-      await supabase.from('bank_pl_categories').insert({ category_id: categoryId, company_id: companyId })
-      setBankIncludedCats(prev => new Set([...prev, categoryId]))
-      // Auto-tag expense transactions in this category as opex
-      if (cat?.type === 'expense') {
-        const txToTag = transactions.filter(t =>
-          t.category_id === categoryId &&
-          t.amount < 0 &&
-          (!companyId || t.company_id === companyId) &&
-          !adjByTx.has(t.id)
-        )
-        if (txToTag.length > 0) {
-          const ids = txToTag.map(t => t.id)
-          await supabase.from('transactions').update({ expense_type: 'opex' }).in('id', ids)
-          setTransactions(prev => prev.map(t => ids.includes(t.id) ? { ...t, expense_type: 'opex' } : t))
-        }
-      }
-    }
+  const entityName = entity === 'all' ? 'All entities' : companies.find(c => c.id === entity)?.name || ''
+  const curItems = scope(cur)
+  const curStmt = buildStatement(curItems, adjByTx)
+  const priorStmt = buildStatement(scope(prior), adjByTx)
+
+  // Columns for the chosen layout. Each: { key, label, items, stmt, drillLabel }
+  let columns
+  if (layout === 'months') {
+    columns = (curCovered.length ? curCovered : cur.months).map(k => {
+      const p = periodFor('month', k)
+      const items = scope(p)
+      return { key: k, label: monthLabel(k), items, stmt: buildStatement(items, adjByTx), drillLabel: monthLabel(k) }
+    })
+    if (columns.length > 1) columns.push({ key: 'total', label: 'Total', items: curItems, stmt: curStmt, drillLabel: periodRange(cur), total: true })
+  } else if (layout === 'entities' && entity === 'all') {
+    columns = companies.map(c => {
+      const items = scope(cur, c.id)
+      return { key: c.id, label: c.name, items, stmt: buildStatement(items, adjByTx), drillLabel: `${c.name}, ${periodRange(cur)}` }
+    })
+    columns.push({ key: 'total', label: 'Total', items: curItems, stmt: curStmt, drillLabel: periodRange(cur), total: true })
+  } else {
+    columns = [
+      { key: 'cur', label: periodShort(cur), items: curItems, stmt: curStmt, drillLabel: periodRange(cur) },
+      { key: 'prior', label: periodShort(prior), items: scope(prior), stmt: priorStmt, drillLabel: periodRange(prior) },
+    ]
+  }
+  const effectiveLayout = layout === 'entities' && entity !== 'all' ? 'compare' : layout
+  const rows = statementRows(activityTest(columns.map(c => c.stmt)))
+
+  // ── Key numbers ──────────────────────────────────────────────────
+  const monthlyDebt = loans
+    .filter(l => entity === 'all' || l.company_id === entity)
+    .reduce((s, l) => s + (parseFloat(l.monthly_payment) || 0), 0)
+  const periodDebt = monthlyDebt * curCovered.length
+  const dscr = periodDebt > 0 ? curStmt.adjustedNoi / periodDebt : null
+  const egiChange = priorCovered.length > 0 && priorStmt.egi ? (curStmt.egi - priorStmt.egi) / Math.abs(priorStmt.egi) : null
+
+  // ── Data health ──────────────────────────────────────────────────
+  const scopeIds = entity === 'all' ? companies.map(c => c.id) : [entity]
+  const tieOut = bankTieOut({ months: curCovered, companyIds: scopeIds, accounts, balances, transactions })
+  const tied = tieOut?.filter(m => m.status === 'tied').map(m => m.key) || []
+  const untied = tieOut?.filter(m => m.status !== 'tied').map(m => m.key) || []
+  const unreviewed = curStmt.adjustments.unreviewed.count
+  const nonOperatingInNoi = [...new Set(curItems
+    .filter(i => i.place === 'noi' && (belowLineFor(i.cat) || /depreciation|amortization/i.test(i.cat.name)))
+    .map(i => i.cat.name))]
+  const noConfig = noiConfig.portfolioCats.size === 0 && noiConfig.cats.size === 0
+
+  // ── Drill-down & adjustments ─────────────────────────────────────
+  function openDrill(row, col) {
+    const items = drillItems(col.items, row.drill, adjByTx)
+    setDrawer({ title: row.label, subtitle: col.drillLabel, items })
+  }
+  function openList(title, items) {
+    setDrawer({ title, subtitle: `${periodRange(cur)} · ${entityName}`, items })
   }
 
-  // Clicking a transaction's checkbox opens the adjustment dialog: a reason
-  // is required to take anything out of NOI.
   function editAdjustment(t) {
     if (adjLegacy) {
       alert('Run supabase/migrations/2026-11-14-noi-adjustments.sql in Supabase to start recording NOI adjustments.')
@@ -135,8 +186,7 @@ export default function PLPage() {
     }
     setAdjEditing({ transactions: [t], existing: adjByTx.get(t.id) || null })
   }
-
-  function applyLocalAdjustments(txs, saved) {
+  function applyLocal(txs, saved) {
     setAdjByTx(prev => {
       const n = new Map(prev)
       txs.forEach(t => n.delete(t.id))
@@ -144,348 +194,198 @@ export default function PLPage() {
       return n
     })
   }
-
   async function saveAdjustment(values) {
     const txs = adjEditing.transactions
     const { saved, error } = await saveAdjustments(supabase, txs, values)
     if (error) return error
-    applyLocalAdjustments(txs, saved)
+    applyLocal(txs, saved)
     setAdjEditing(null)
     return null
   }
-
   async function removeAdjustment() {
     const txs = adjEditing.transactions
     const { error } = await removeAdjustments(supabase, txs)
     if (error) return error
-    applyLocalAdjustments(txs, [])
+    applyLocal(txs, [])
     setAdjEditing(null)
     return null
   }
 
-  function toggleExpandBankCat(catId) {
-    setExpandedBankCats(prev => {
-      const n = new Set(prev)
-      n.has(catId) ? n.delete(catId) : n.add(catId)
-      return n
-    })
-  }
-
-  const dateFrom = `${year}-${String(monthFrom).padStart(2, '0')}-01`
-  const dateTo = `${year}-${String(monthTo).padStart(2, '0')}-31`
-
-  // Standard P&L filtered transactions
-  let filtered = transactions.filter(t => {
-    if (t.date < dateFrom || t.date > dateTo) return false
-    if (companyFilter !== 'all' && t.company_id !== companyFilter) return false
-    return true
-  })
-  filtered = filterTransactions(filtered, mode === 'bank_pl' ? 'detailed' : mode)
-  const pl = buildPL(filtered, categories)
-
-  // Bank P&L filtered transactions
-  const bankDateFiltered = transactions.filter(t => {
-    if (t.date < dateFrom || t.date > dateTo) return false
-    if (bankEntity !== 'portfolio' && t.company_id !== bankEntity) return false
-    return true
-  })
-  const bankReportedTxs = bankDateFiltered.filter(t => bankIncludedCats.has(t.category_id))
-  const bankPL = buildPL(applyAdjustments(bankReportedTxs, adjByTx), categories)
-  const bankReportedPL = buildPL(bankReportedTxs, categories)
-  const bankAdjCount = bankReportedTxs.filter(t => adjByTx.has(t.id)).length
-  const bankUnreviewed = bankReportedTxs.filter(t => adjByTx.get(t.id)?.treatment === 'unreviewed').length
-
-  // Transactions per category for Bank P&L drill-down (for config panel)
-  function txsForBankCategory(catId) {
-    return bankDateFiltered.filter(t => t.category_id === catId)
-  }
-
-  function buildMonthlyPL() {
-    const months = {}
-    for (let m = monthFrom; m <= monthTo; m++) {
-      const key = `${year}-${String(m).padStart(2, '0')}`
-      const monthTx = filtered.filter(t => t.date.startsWith(key))
-      months[key] = buildPL(monthTx, categories)
-    }
-    return months
-  }
-  const monthlyData = view === 'monthly' ? buildMonthlyPL() : null
-
-  function buildByCompany() {
-    if (companyFilter !== 'all') return null
-    return companies.map(co => {
-      const coTx = filterTransactions(filtered.filter(t => t.company_id === co.id), mode)
-      return { company: co, pl: buildPL(coTx, categories) }
-    })
-  }
-  const byCompany = showByCompany ? buildByCompany() : null
-
-  const modeLabel = {
-    detailed: 'Detailed (Accrual)',
-    non_detailed: 'Non-Detailed (Cash)',
-    full: 'Full',
-    bank_pl: 'Bank P&L',
-  }
-
-  const incomeCategories = categories.filter(c => c.type === 'income')
-  const expenseCategories = categories.filter(c => c.type === 'expense')
-
-  // CSV export mirrors whichever statement is on screen
-  const entityName = mode === 'bank_pl'
-    ? (bankEntity === 'portfolio' ? 'Portfolio' : companies.find(c => c.id === bankEntity)?.name)
-    : (companyFilter === 'all' ? 'Consolidated' : companies.find(c => c.id === companyFilter)?.name)
+  // ── CSV mirrors the table on screen ──────────────────────────────
   function csvRows() {
-    if (mode === 'bank_pl') return plRows([{ label: entityName, pl: bankPL }])
-    if (showByCompany && byCompany) return plRows(byCompany.map(({ company, pl: coPL }) => ({ label: company.name, pl: coPL })))
-    if (view === 'monthly' && monthlyData) {
-      return plRows(Object.entries(monthlyData).map(([key, monthPL]) => ({
-        label: `${MONTHS[parseInt(key.split('-')[1]) - 1]} ${year}`,
-        pl: monthPL,
-      })))
-    }
-    return plRows([{ label: entityName, pl }])
+    const compare = effectiveLayout === 'compare'
+    const head = compare
+      ? ['Line', columns[0].label, '% of EGI', columns[1].label, 'Variance $', 'Variance %']
+      : ['Line', ...columns.map(c => c.label), '% of EGI']
+    const out = [[`${periodTitle(cur)} · ${entityName} · Operating, cash basis, unaudited`], head]
+    const base = compare ? columns[0] : columns[columns.length - 1]
+    rows.forEach(r => {
+      if (r.kind === 'header') { out.push([r.label]); return }
+      const pctEgi = NO_PCT.has(r.key) || r.key.startsWith('adj_') || !base.stmt.egi ? '' : csvPct(r.get(base.stmt) / base.stmt.egi * 100)
+      if (compare) {
+        const v = variance(r.get(columns[0].stmt), r.get(columns[1].stmt), r.cost)
+        const noPrior = priorCovered.length === 0
+        out.push([r.label, money(r.get(columns[0].stmt)), pctEgi, noPrior ? '' : money(r.get(columns[1].stmt)),
+          noPrior ? '' : money(v.diff), noPrior || v.pct === null ? '' : csvPct(v.pct * 100)])
+      } else {
+        out.push([r.label, ...columns.map(c => money(r.get(c.stmt))), pctEgi])
+      }
+    })
+    return out
   }
 
   if (loading) return <div className="p-8 text-slate-400 text-sm">Loading...</div>
 
+  const segBtn = on => `px-3 py-1.5 text-sm ${on ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-50'}`
+
   return (
     <div className="p-8">
-      <div className="print-hide flex items-center justify-between mb-6">
+      <div className="print-hide flex items-start justify-between mb-5 gap-4">
         <div>
           <h1 className="text-xl font-bold text-slate-900">P&L Statement</h1>
-          <p className="text-sm text-slate-500 mt-0.5">{modeLabel[mode]}</p>
+          <p className="text-sm text-slate-500 mt-0.5">
+            {periodTitle(cur)} · {entityName}
+            <span className="ml-2 text-xs px-1.5 py-0.5 rounded border border-slate-200 text-slate-500">Operating · Cash basis</span>
+          </p>
         </div>
         <div className="flex gap-2">
           <ExportCsvButton
-            filename={() => csvFilename(mode === 'bank_pl' ? 'bank-pl' : 'pl', entityName, year, MONTHS[monthFrom - 1], MONTHS[monthTo - 1])}
+            filename={() => csvFilename('pl', entityName, periodShort(cur))}
             getRows={csvRows}
           />
-          <button
-            onClick={() => window.print()}
-            className="px-4 py-2 text-sm border border-slate-200 rounded-lg text-slate-600 hover:bg-slate-50"
-          >
+          <button onClick={() => window.print()}
+            className="px-4 py-2 text-sm border border-slate-200 rounded-lg text-slate-600 hover:bg-slate-50">
             Print / PDF
           </button>
         </div>
       </div>
 
       {/* Controls */}
-      <div className="print-hide bg-white rounded-xl border border-slate-200 p-4 mb-6 flex flex-wrap gap-3 items-end">
-        {mode !== 'bank_pl' && (
-          <div>
-            <label className="block text-xs font-medium text-slate-500 mb-1">Entity</label>
-            <select value={companyFilter} onChange={e => setCompanyFilter(e.target.value)}
-              className="border border-slate-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-slate-900">
-              <option value="all">All Entities (Consolidated)</option>
-              {companies.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-            </select>
-          </div>
-        )}
-        <div>
-          <label className="block text-xs font-medium text-slate-500 mb-1">Year</label>
-          <select value={year} onChange={e => setYear(Number(e.target.value))}
-            className="border border-slate-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-slate-900">
-            {YEARS.map(y => <option key={y} value={y}>{y}</option>)}
-          </select>
-        </div>
-        <div>
-          <label className="block text-xs font-medium text-slate-500 mb-1">From</label>
-          <select value={monthFrom} onChange={e => setMonthFrom(Number(e.target.value))}
-            className="border border-slate-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-slate-900">
-            {MONTHS.map((m, i) => <option key={i} value={i + 1}>{m}</option>)}
-          </select>
-        </div>
-        <div>
-          <label className="block text-xs font-medium text-slate-500 mb-1">To</label>
-          <select value={monthTo} onChange={e => setMonthTo(Number(e.target.value))}
-            className="border border-slate-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-slate-900">
-            {MONTHS.map((m, i) => <option key={i} value={i + 1}>{m}</option>)}
-          </select>
-        </div>
-        <div>
-          <label className="block text-xs font-medium text-slate-500 mb-1">Mode</label>
-          <select value={mode} onChange={e => setMode(e.target.value)}
-            className="border border-slate-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-slate-900">
-            <option value="detailed">Detailed (Accrual)</option>
-            <option value="non_detailed">Non-Detailed (Cash)</option>
-            <option value="full">Full</option>
-            <option value="bank_pl">Bank P&L</option>
-          </select>
-        </div>
-        {mode !== 'bank_pl' && (
-          <div className="flex gap-2">
-            <button onClick={() => setView('summary')}
-              className={`px-3 py-1.5 text-sm rounded-lg border ${view === 'summary' ? 'bg-slate-900 text-white border-slate-900' : 'border-slate-200 text-slate-600 hover:bg-slate-50'}`}>
-              Summary
-            </button>
-            <button onClick={() => setView('monthly')}
-              className={`px-3 py-1.5 text-sm rounded-lg border ${view === 'monthly' ? 'bg-slate-900 text-white border-slate-900' : 'border-slate-200 text-slate-600 hover:bg-slate-50'}`}>
-              By Month
-            </button>
-          </div>
-        )}
-        {mode !== 'bank_pl' && companyFilter === 'all' && (
-          <button onClick={() => setShowByCompany(v => !v)}
-            className={`px-3 py-1.5 text-sm rounded-lg border ${showByCompany ? 'bg-slate-900 text-white border-slate-900' : 'border-slate-200 text-slate-600 hover:bg-slate-50'}`}>
-            Side-by-Side
-          </button>
-        )}
-        <button onClick={() => setShowPct(v => !v)}
-          className={`px-3 py-1.5 text-sm rounded-lg border ${showPct ? 'bg-slate-900 text-white border-slate-900' : 'border-slate-200 text-slate-600 hover:bg-slate-50'}`}>
-          % of Revenue
-        </button>
-      </div>
-
-      {/* ── Statement Output ───────────────────────────────────────── */}
-      <div className="print-area">
-      <PrintHeader
-        logoUrl={reportSettings.logo_url}
-        reportName={reportSettings.report_name}
-        subtitle={reportSettings.report_subtitle}
-        title={mode === 'bank_pl' ? 'Bank P&L Statement' : 'Profit & Loss Statement'}
-        dateRange={`${MONTHS[monthFrom - 1]} – ${MONTHS[monthTo - 1]} ${year}`}
-      />
-      {mode === 'bank_pl' ? (
-        <div className="flex gap-6 items-start">
-
-          {/* Left: Configuration panel */}
-          <div className="print-hide w-80 flex-shrink-0 bg-white rounded-xl border border-slate-200 overflow-hidden sticky top-4">
-            <div className="px-4 py-3 border-b border-slate-100 bg-slate-50">
-              <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Configure for</p>
-              <select value={bankEntity} onChange={e => setBankEntity(e.target.value)}
-                className="w-full border border-slate-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-slate-900">
-                <option value="portfolio">Portfolio (All Entities)</option>
-                {companies.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-              </select>
-              <div className="mt-2">
-                <p className="text-xs text-slate-400">
-                  {bankIncludedCats.size} categor{bankIncludedCats.size === 1 ? 'y' : 'ies'} selected
-                  {bankAdjCount > 0 && `, ${bankAdjCount} adjusted`}
-                </p>
-              </div>
-            </div>
-
-            <div className="p-4 space-y-4 max-h-[70vh] overflow-y-auto">
-              {/* Income categories */}
-              <div>
-                <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Income</p>
-                <div className="space-y-1">
-                  {incomeCategories.map(cat => {
-                    const included = bankIncludedCats.has(cat.id)
-                    const expanded = expandedBankCats.has(cat.id)
-                    const txs = txsForBankCategory(cat.id)
-                    return (
-                      <div key={cat.id}>
-                        <div className="flex items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-slate-50">
-                          <input type="checkbox" checked={included} onChange={() => toggleBankCategory(cat.id)}
-                            className="rounded border-slate-300 text-slate-900 focus:ring-slate-900" />
-                          <span className={`flex-1 text-sm ${included ? 'text-slate-800 font-medium' : 'text-slate-400'}`}>
-                            {cat.name}
-                          </span>
-                          {included && txs.length > 0 && (
-                            <button onClick={() => toggleExpandBankCat(cat.id)}
-                              className="text-xs text-slate-400 hover:text-slate-700 font-mono">
-                              {expanded ? '▼' : '▶'} {txs.length}
-                            </button>
-                          )}
-                        </div>
-                        {included && expanded && txs.length > 0 && (
-                          <div className="ml-6 mt-1 mb-2 space-y-0.5 border-l-2 border-slate-100 pl-3">
-                            {txs.map(t => (
-                              <BankTxRow key={t.id} t={t} adj={adjByTx.get(t.id)} onEdit={() => editAdjustment(t)} />
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    )
-                  })}
-                </div>
-              </div>
-
-              {/* Expense categories */}
-              <div>
-                <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Expenses</p>
-                <div className="space-y-1">
-                  {expenseCategories.map(cat => {
-                    const included = bankIncludedCats.has(cat.id)
-                    const expanded = expandedBankCats.has(cat.id)
-                    const txs = txsForBankCategory(cat.id)
-                    return (
-                      <div key={cat.id}>
-                        <div className="flex items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-slate-50">
-                          <input type="checkbox" checked={included} onChange={() => toggleBankCategory(cat.id)}
-                            className="rounded border-slate-300 text-slate-900 focus:ring-slate-900" />
-                          <span className={`flex-1 text-sm ${included ? 'text-slate-800 font-medium' : 'text-slate-400'}`}>
-                            {cat.name}
-                          </span>
-                          {included && txs.length > 0 && (
-                            <button onClick={() => toggleExpandBankCat(cat.id)}
-                              className="text-xs text-slate-400 hover:text-slate-700 font-mono">
-                              {expanded ? '▼' : '▶'} {txs.length}
-                            </button>
-                          )}
-                        </div>
-                        {included && expanded && txs.length > 0 && (
-                          <div className="ml-6 mt-1 mb-2 space-y-0.5 border-l-2 border-slate-100 pl-3">
-                            {txs.map(t => (
-                              <BankTxRow key={t.id} t={t} adj={adjByTx.get(t.id)} onEdit={() => editAdjustment(t)} />
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    )
-                  })}
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Right: Bank P&L preview */}
-          <div className="flex-1">
-            <PLTable pl={bankPL} showPct={showPct}
-              title={bankEntity === 'portfolio' ? 'Portfolio — Bank P&L' : (companies.find(c => c.id === bankEntity)?.name + ' — Bank P&L')} />
-            {bankAdjCount > 0 && (
-              <div className="mt-4 bg-white rounded-xl border border-slate-200 px-6 py-4 text-sm">
-                <div className="flex justify-between">
-                  <span className="text-slate-600">Reported NOI (before adjustments)</span>
-                  <span className="font-mono text-slate-700">{formatCurrency(bankReportedPL.noi)}</span>
-                </div>
-                <div className="flex justify-between mt-1">
-                  <span className="text-slate-600">NOI adjustments ({bankAdjCount})</span>
-                  <span className="font-mono text-slate-700">{bankPL.noi - bankReportedPL.noi >= 0 ? '+' : ''}{formatCurrency(bankPL.noi - bankReportedPL.noi)}</span>
-                </div>
-                <div className="flex justify-between mt-1 pt-2 border-t border-slate-100 font-semibold">
-                  <span>Adjusted NOI (shown above)</span>
-                  <span className="font-mono">{formatCurrency(bankPL.noi)}</span>
-                </div>
-                <div className="print-hide mt-3 flex items-center justify-between">
-                  {bankUnreviewed > 0
-                    ? <span className="text-xs text-red-600">{bankUnreviewed} adjustment{bankUnreviewed !== 1 ? 's' : ''} need a reason</span>
-                    : <span />}
-                  <Link href="/adjustments" className="text-xs text-slate-500 hover:text-slate-900 underline">Review all adjustments →</Link>
-                </div>
-              </div>
-            )}
-            {bankIncludedCats.size === 0 && (
-              <p className="text-sm text-slate-400 mt-4 text-center">
-                Select categories on the left to build your Bank P&L.
-              </p>
-            )}
-          </div>
-        </div>
-
-      ) : showByCompany && byCompany ? (
-        <div className="grid gap-4" style={{ gridTemplateColumns: `repeat(${byCompany.length}, 1fr)` }}>
-          {byCompany.map(({ company, pl: coPL }) => (
-            <PLTable key={company.id} pl={coPL} title={company.name} showPct={showPct} />
+      <div className="print-hide flex flex-wrap items-center gap-3 mb-5">
+        <select value={entity} onChange={e => setEntity(e.target.value)}
+          className="border border-slate-200 rounded-lg px-3 py-1.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-slate-900">
+          <option value="all">All entities</option>
+          {companies.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+        </select>
+        <div className="inline-flex rounded-lg border border-slate-200 overflow-hidden bg-white">
+          {PERIODS.map(p => (
+            <button key={p.value} onClick={() => setPeriodKind(p.value)} className={segBtn(periodKind === p.value)}>{p.label}</button>
           ))}
         </div>
-      ) : view === 'monthly' && monthlyData ? (
-        <MonthlyPLTable monthlyData={monthlyData} months={MONTHS} monthFrom={monthFrom} monthTo={monthTo} year={year} showPct={showPct} />
-      ) : (
-        <PLTable pl={pl} showPct={showPct} title={companyFilter === 'all' ? 'Consolidated' : companies.find(c => c.id === companyFilter)?.name} />
+        <label className="text-xs text-slate-500 flex items-center gap-2">
+          {periodKind === 'month' ? 'Month' : 'Through'}
+          <select value={end} onChange={e => setAsOf(e.target.value)}
+            className="border border-slate-200 rounded-lg px-3 py-1.5 text-sm bg-white text-slate-800 focus:outline-none focus:ring-2 focus:ring-slate-900">
+            {monthOptions.map(k => <option key={k} value={k}>{monthLabel(k)}</option>)}
+          </select>
+        </label>
+        <div className="inline-flex rounded-lg border border-slate-200 overflow-hidden bg-white">
+          {LAYOUTS.filter(l => l.value !== 'entities' || (entity === 'all' && companies.length > 1)).map(l => (
+            <button key={l.value} onClick={() => setLayout(l.value)} className={segBtn(effectiveLayout === l.value)}>{l.label}</button>
+          ))}
+        </div>
+      </div>
+
+      {noConfig && (
+        <div className="print-hide bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 mb-5 text-sm text-amber-800">
+          Nothing is counted in NOI yet. <Link href="/settings?tab=noi" className="underline">Choose what counts in NOI</Link> to build the statement.
+        </div>
       )}
-      </div>{/* end print-area */}
+
+      {curCovered.length > 0 && curCovered.length < cur.months.length && (
+        <div className="bg-sky-50 border border-sky-200 rounded-xl px-4 py-3 mb-5 text-sm text-sky-800">
+          Only {curCovered.length} of {cur.months.length} months have data (books start {monthLabel(firstDataKey)}).
+          Totals cover {periodRange({ from: curCovered[0], to: cur.to })}; DSCR uses the same {curCovered.length} months of debt service.
+        </div>
+      )}
+
+      {/* Key numbers */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-3">
+        <Kpi label="Effective gross income" value={acct(curStmt.egi, { dollar: true })}
+          sub={egiChange === null ? 'No prior-year data' : `${egiChange >= 0 ? '+' : '−'}${Math.abs(egiChange * 100).toFixed(1)}% vs ${periodShort(prior)}`}
+          tone={egiChange === null ? null : egiChange >= 0 ? 'good' : 'bad'} />
+        <Kpi label="Expense ratio" value={curStmt.expenseRatio === null ? '—' : acctPct(curStmt.expenseRatio)}
+          sub={priorCovered.length === 0 || priorStmt.expenseRatio === null ? 'Opex ÷ EGI' : `${acctPct(priorStmt.expenseRatio)} prior year`} />
+        <Kpi label="Adjusted NOI" value={acct(curStmt.adjustedNoi, { dollar: true })}
+          sub={curStmt.totalAdjustments ? `Reported ${acct(curStmt.noi, { dollar: true })}` : 'No adjustments'} />
+        <Kpi label="DSCR" value={dscr === null ? '—' : `${dscr.toFixed(2)}x`}
+          sub={dscr === null
+            ? <Link href="/debt-equity" className="underline print-hide">Add loans in Debt &amp; Equity</Link>
+            : `Adjusted NOI ÷ ${acct(periodDebt, { dollar: true })} scheduled debt service`}
+          tone={dscr === null ? null : dscr >= 1.25 ? null : 'bad'} />
+      </div>
+
+      {/* Data health */}
+      <div className="print-hide flex flex-wrap gap-2 mb-5">
+        {curStmt.uncategorized > 0 && (
+          <Chip tone="warn" onClick={() => openList('Uncategorized transactions', curItems.filter(i => i.place === 'uncategorized'))}>
+            {curStmt.uncategorized} uncategorized
+          </Chip>
+        )}
+        {tieOut === null ? (
+          <Chip tone="muted" href="/balances">No bank accounts set up for reconciliation</Chip>
+        ) : (
+          <>
+            {untied.length > 0 && <Chip tone="warn" href="/balances">{monthRuns(untied)} not tied to bank</Chip>}
+            {tied.length > 0 && <Chip tone="good" href="/balances">{monthRuns(tied)} tied to bank</Chip>}
+          </>
+        )}
+        {unreviewed > 0 && (
+          <Chip tone="bad" href="/adjustments">{unreviewed} adjustment{unreviewed !== 1 ? 's' : ''} need{unreviewed === 1 ? 's' : ''} a reason</Chip>
+        )}
+        {nonOperatingInNoi.length > 0 && (
+          <Chip tone="warn" href="/settings?tab=noi" title={nonOperatingInNoi.join(', ')}>
+            {nonOperatingInNoi.length === 1 ? nonOperatingInNoi[0] : `${nonOperatingInNoi.length} non-operating categories`} counted in NOI
+          </Chip>
+        )}
+        {curStmt.uncategorized === 0 && untied.length === 0 && unreviewed === 0 && nonOperatingInNoi.length === 0 && tieOut !== null && (
+          <Chip tone="good">Books complete for this period</Chip>
+        )}
+      </div>
+
+      {/* Statement */}
+      <div className="print-area">
+        <PrintHeader
+          logoUrl={reportSettings.logo_url}
+          reportName={reportSettings.report_name}
+          subtitle={reportSettings.report_subtitle}
+          title={`Operating Statement · ${entityName}`}
+          dateRange={periodTitle(cur)}
+        />
+        <StatementTable rows={rows} columns={columns} layout={effectiveLayout} onDrill={openDrill} priorEmpty={priorCovered.length === 0} />
+        <p className="text-xs text-slate-400 mt-2 px-1">
+          Cash basis, unaudited. Operating lens: NOI includes the categories chosen in{' '}
+          <Link href="/settings?tab=noi" className="underline">What counts in NOI</Link>.
+          Cash flow after debt service starts from reported NOI.
+          <span className="print-hide"> Click any amount to see its transactions.</span>
+        </p>
+
+        {curStmt.off.length > 0 && (
+          <div className="print-hide mt-4 bg-white rounded-xl border border-slate-200 px-4 py-3">
+            <p className="text-xs font-medium text-slate-500 mb-2">Not on this statement ({periodShort(cur)})</p>
+            <div className="flex flex-wrap gap-x-5 gap-y-1">
+              {curStmt.off.map(o => (
+                <button key={o.name} className="text-xs text-slate-500 hover:text-slate-900 tabular-nums"
+                  onClick={() => openList(o.name, drillItems(curItems, { place: 'off', category: o.name }, adjByTx))}>
+                  {o.name} <span className="text-slate-400">{acct(o.amount)}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {drawer && (
+        <TransactionDrawer
+          {...drawer}
+          companies={companies}
+          showEntity={entity === 'all'}
+          adjByTx={adjByTx}
+          canAdjust={isOwner}
+          onAdjust={editAdjustment}
+          onClose={() => setDrawer(null)}
+        />
+      )}
 
       {adjEditing && (
         <AdjustmentModal
@@ -500,228 +400,219 @@ export default function PLPage() {
   )
 }
 
-// One transaction in the Bank P&L drill-down. Unchecked = adjusted out of NOI.
-function BankTxRow({ t, adj, onEdit }) {
-  const partial = isPartial(t, adj)
-  const info = adj ? treatmentInfo(adj.treatment) : null
+// ── Pieces ───────────────────────────────────────────────────────────
+
+function Kpi({ label, value, sub, tone }) {
+  const subCls = tone === 'good' ? 'text-emerald-700' : tone === 'bad' ? 'text-amber-700' : 'text-slate-500'
   return (
-    <div className="flex items-start gap-2 py-1">
-      <input type="checkbox" checked={!adj || partial} onChange={onEdit}
-        title={adj ? 'Edit NOI adjustment' : 'Exclude from NOI'}
-        className="mt-0.5 rounded border-slate-300 text-slate-900 focus:ring-slate-900" />
-      <div className="flex-1 min-w-0">
-        <p className={`text-xs truncate ${adj && !partial ? 'text-slate-300 line-through' : 'text-slate-600'}`}>
-          {t.description}
-        </p>
-        <p className="text-xs text-slate-400">{t.date} · {formatCurrency(Math.abs(t.amount))}</p>
-        {adj && (
-          <button onClick={onEdit} className="block text-left mt-0.5 w-full">
-            <span className={`inline-block text-[10px] px-1.5 py-0.5 rounded border ${info.badge}`}>
-              {info.short}{partial ? ` · ${formatCurrency(excludedAmount(t, adj))} out` : ''}
-            </span>
-            {adj.reason
-              ? <span className="block text-xs text-slate-500 italic mt-0.5 line-clamp-2">{adj.reason}</span>
-              : <span className="block text-xs text-red-500 mt-0.5">Add a reason</span>}
-          </button>
-        )}
-      </div>
+    <div className="bg-white rounded-xl border border-slate-200 px-4 py-3">
+      <p className="text-xs text-slate-500">{label}</p>
+      <p className="text-xl font-semibold text-slate-900 tabular-nums mt-0.5">{value}</p>
+      <p className={`text-xs mt-0.5 ${subCls}`}>{sub}</p>
     </div>
   )
 }
 
-function PLTable({ pl, title, showPct }) {
-  const [showIncome, setShowIncome] = useState(true)
-  const [showExpenses, setShowExpenses] = useState(true)
+const CHIP_TONES = {
+  warn: 'bg-amber-50 text-amber-800 border-amber-200',
+  bad: 'bg-red-50 text-red-700 border-red-200',
+  good: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+  muted: 'bg-slate-50 text-slate-500 border-slate-200',
+}
+function Chip({ tone, href, onClick, title, children }) {
+  const cls = `text-xs px-2 py-1 rounded-md border ${CHIP_TONES[tone]} ${href || onClick ? 'hover:brightness-95' : ''}`
+  if (href) return <Link href={href} className={cls} title={title}>{children}</Link>
+  if (onClick) return <button onClick={onClick} className={cls} title={title}>{children}</button>
+  return <span className={cls} title={title}>{children}</span>
+}
 
-  function pct(amt) {
-    if (!pl.totalIncome || pl.totalIncome === 0) return '—'
-    return (Math.abs(amt) / pl.totalIncome * 100).toFixed(1) + '%'
+// The statement itself: accounting typography, fixed line order, sticky
+// first column and header.
+function StatementTable({ rows, columns, layout, onDrill, priorEmpty }) {
+  const compare = layout === 'compare'
+  const pctCol = compare ? columns[0] : columns[columns.length - 1]
+  const [curCol, priorCol] = columns
+
+  const head = compare
+    ? [curCol.label, '% EGI', priorCol.label, 'Var $', 'Var %']
+    : [...columns.map(c => c.label), '% EGI']
+
+  const pctOf = (r, col) => {
+    if (r.kind === 'header' || NO_PCT.has(r.key) || r.key.startsWith('adj_') || !col.stmt.egi) return ''
+    return acctPct(r.get(col.stmt) / col.stmt.egi)
+  }
+
+  function rowCls(r) {
+    if (r.kind === 'header') return 'text-[11px] font-semibold uppercase tracking-wider text-slate-400'
+    if (r.kind === 'noi') return 'font-semibold text-slate-900'
+    if (r.kind === 'subtotal') return 'font-semibold text-slate-900'
+    return 'text-slate-800'
+  }
+  // Rules: single above subtotals, single above + double below NOI
+  function cellBorder(r) {
+    if (r.kind === 'noi') return 'border-t border-slate-400 border-b-[3px] border-b-slate-400 border-double'
+    if (r.kind === 'subtotal') return 'border-t border-slate-300'
+    return ''
+  }
+
+  function amountCell(r, col) {
+    const text = acct(r.get(col.stmt))
+    const cls = `px-3 py-1.5 text-right tabular-nums whitespace-nowrap ${cellBorder(r)}`
+    if (r.drill && text !== '–' && text !== '') {
+      return (
+        <td key={col.key} className={cls}>
+          <button onClick={() => onDrill(r, col)} className="hover:underline decoration-slate-300 underline-offset-2">{text}</button>
+        </td>
+      )
+    }
+    return <td key={col.key} className={`${cls} ${text === '–' ? 'text-slate-300' : ''}`}>{text}</td>
   }
 
   return (
-    <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
-      <div className="px-6 py-4 border-b border-slate-100">
-        <h2 className="font-semibold text-slate-900">{title}</h2>
-      </div>
-      <div className="p-6 space-y-6">
-        {/* Income */}
-        <div>
-          <button onClick={() => setShowIncome(v => !v)}
-            className="flex items-center gap-2 w-full text-left mb-3 group">
-            <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Income</h3>
-            <span className="text-xs text-slate-400 group-hover:text-slate-600">{showIncome ? '▼' : '▶'}</span>
-          </button>
-          {showIncome && (
-            <div className="space-y-1.5">
-              {pl.income.map(([name, amt]) => (
-                <div key={name} className="flex justify-between items-center text-sm gap-4">
-                  <span className="text-slate-700">{name}</span>
-                  <span className="font-mono text-emerald-600">{formatCurrency(amt)}</span>
-                </div>
-              ))}
-              {pl.income.length === 0 && <p className="text-sm text-slate-400">No income recorded</p>}
-            </div>
-          )}
-          <div className="flex justify-between items-center text-sm font-semibold mt-3 pt-3 border-t border-slate-100">
-            <span>Total Income</span>
-            <span className="font-mono text-emerald-600">{formatCurrency(pl.totalIncome)}</span>
-          </div>
-        </div>
-
-        {/* Expenses */}
-        <div>
-          <button onClick={() => setShowExpenses(v => !v)}
-            className="flex items-center gap-2 w-full text-left mb-3 group">
-            <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Expenses</h3>
-            <span className="text-xs text-slate-400 group-hover:text-slate-600">{showExpenses ? '▼' : '▶'}</span>
-          </button>
-          {showExpenses && (
-            <div className="space-y-1.5">
-              {pl.expenses.map(([name, amt]) => (
-                <div key={name} className="flex justify-between items-center text-sm gap-4">
-                  <span className="text-slate-700 flex-1">{name}</span>
-                  <span className="font-mono text-red-600">{formatCurrency(amt)}</span>
-                  {showPct && (
-                    <span className="font-mono text-slate-400 text-xs w-12 text-right">{pct(amt)}</span>
-                  )}
-                </div>
-              ))}
-              {pl.expenses.length === 0 && <p className="text-sm text-slate-400">No expenses recorded</p>}
-            </div>
-          )}
-          <div className="flex justify-between items-center text-sm font-semibold mt-3 pt-3 border-t border-slate-100">
-            <span>Total Expenses</span>
-            <span className="font-mono text-red-600">{formatCurrency(pl.totalExpenses)}</span>
-          </div>
-        </div>
-
-        {/* NOI */}
-        <div className={`rounded-lg p-4 ${pl.noi >= 0 ? 'bg-emerald-50 border border-emerald-200' : 'bg-red-50 border border-red-200'}`}>
-          <div className="flex justify-between items-center">
-            <span className="font-bold text-slate-900">Net Operating Income (NOI)</span>
-            <span className={`font-mono font-bold text-lg ${pl.noi >= 0 ? 'text-emerald-700' : 'text-red-700'}`}>
-              {formatCurrency(pl.noi)}
-            </span>
-          </div>
-        </div>
-      </div>
+    <div className="statement-scroll bg-white rounded-xl border border-slate-200 overflow-auto max-h-[78vh]">
+      <table className="w-full text-sm border-separate border-spacing-0">
+        <thead>
+          <tr>
+            <th className="sticky top-0 left-0 z-30 bg-white border-b border-slate-200 px-4 py-2.5 text-left min-w-[15rem]" />
+            {head.map((h, i) => (
+              <th key={i} className={`sticky top-0 z-20 bg-white border-b border-slate-200 px-3 py-2.5 text-right text-xs font-medium whitespace-nowrap ${
+                (compare && i > 0) || (!compare && i === head.length - 1) ? 'text-slate-400' : 'text-slate-600'}`}>
+                {h}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(r => {
+            if (r.kind === 'header') {
+              return (
+                <tr key={r.key} className={rowCls(r)}>
+                  <td className="sticky left-0 z-10 bg-white px-4 pt-4 pb-1">{r.label}</td>
+                  <td colSpan={head.length} className="pt-4 pb-1" />
+                </tr>
+              )
+            }
+            const indent = r.kind === 'line'
+            const adjCount = r.adjCount ? Math.max(...columns.map(c => r.adjCount(c.stmt))) : 0
+            let varCells = null
+            if (compare && priorEmpty) {
+              varCells = (
+                <>
+                  <td className={cellBorder(r)} />
+                  <td className={cellBorder(r)} />
+                </>
+              )
+            } else if (compare) {
+              const v = variance(r.get(curCol.stmt), r.get(priorCol.stmt), r.cost)
+              const flag = v.pct !== null && v.pct < FLAG_AT && Math.round(r.get(curCol.stmt)) !== 0
+              varCells = (
+                <>
+                  <td className={`px-3 py-1.5 text-right tabular-nums whitespace-nowrap text-slate-500 ${cellBorder(r)}`}>{acct(v.diff)}</td>
+                  <td className={`px-3 py-1.5 text-right tabular-nums whitespace-nowrap ${flag ? 'text-amber-700 font-medium' : 'text-slate-500'} ${cellBorder(r)}`}>
+                    {v.pct === null ? '' : acctPct(v.pct)}
+                  </td>
+                </>
+              )
+            }
+            return (
+              <tr key={r.key} className={`${rowCls(r)} hover:bg-slate-50/60`}>
+                <td className={`sticky left-0 z-10 bg-white py-1.5 pr-3 whitespace-nowrap ${indent ? 'pl-8 text-slate-600' : 'pl-4'} ${cellBorder(r)}`}>
+                  {r.label}
+                  {adjCount > 0 && <span className="ml-1.5 text-[11px] text-sky-700">· {adjCount} adj.</span>}
+                  {r.note && <span className="ml-1.5 text-[11px] font-normal text-slate-400">{r.note}</span>}
+                </td>
+                {compare ? (
+                  <>
+                    {amountCell(r, curCol)}
+                    <td className={`px-3 py-1.5 text-right tabular-nums text-slate-500 ${cellBorder(r)}`}>{pctOf(r, curCol)}</td>
+                    {amountCell(r, priorCol)}
+                    {varCells}
+                  </>
+                ) : (
+                  <>
+                    {columns.map(c => amountCell(r, c))}
+                    <td className={`px-3 py-1.5 text-right tabular-nums text-slate-500 ${cellBorder(r)}`}>{pctOf(r, pctCol)}</td>
+                  </>
+                )}
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
     </div>
   )
 }
 
-function MonthlyPLTable({ monthlyData, months, monthFrom, monthTo, year, showPct }) {
-  const [showIncome, setShowIncome] = useState(true)
-  const [showExpenses, setShowExpenses] = useState(true)
-  const keys = Object.keys(monthlyData)
+const SOURCE_LABEL = { bank: 'Bank', credit_card: 'Card' }
+
+// Slide-over listing the transactions behind a number, with their NOI
+// adjustments. This is where items get tagged in or out of NOI.
+function TransactionDrawer({ title, subtitle, items, companies, showEntity, adjByTx, canAdjust, onAdjust, onClose }) {
+  const coName = Object.fromEntries(companies.map(c => [c.id, c.name]))
+  const sorted = [...items].sort((a, b) => b.t.date.localeCompare(a.t.date))
+  const total = items.reduce((s, i) => s + (Number(i.t.amount) || 0), 0)
+
+  useEffect(() => {
+    const onKey = e => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
   return (
-    <div className="bg-white rounded-xl border border-slate-200 overflow-x-auto">
-      <table className="text-sm w-full">
-        <thead>
-          <tr className="border-b border-slate-100 bg-slate-50">
-            <th className="text-left px-4 py-2.5 text-xs font-semibold text-slate-500 uppercase tracking-wider">Category</th>
-            {keys.map(k => (
-              <th key={k} className="text-right px-4 py-2.5 text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                {months[parseInt(k.split('-')[1]) - 1]}
-              </th>
-            ))}
-            <th className="text-right px-4 py-2.5 text-xs font-semibold text-slate-500 uppercase tracking-wider">Total</th>
-          </tr>
-        </thead>
-        <tbody className="divide-y divide-slate-50">
-          {/* Income header row */}
-          <tr className="bg-slate-50 cursor-pointer hover:bg-slate-100" onClick={() => setShowIncome(v => !v)}>
-            <td colSpan={keys.length + 2} className="px-4 py-2 text-xs font-semibold text-slate-500 uppercase tracking-wider">
-              <span className="mr-1.5">{showIncome ? '▼' : '▶'}</span>Income
-            </td>
-          </tr>
-          {showIncome && (() => {
-            const allIncome = new Set(keys.flatMap(k => monthlyData[k].income.map(([n]) => n)))
-            return [...allIncome].map(name => {
-              const total = keys.reduce((s, k) => {
-                const row = monthlyData[k].income.find(([n]) => n === name)
-                return s + (row ? row[1] : 0)
-              }, 0)
-              return (
-                <tr key={name} className="hover:bg-slate-50">
-                  <td className="px-4 py-2 text-slate-700">{name}</td>
-                  {keys.map(k => {
-                    const row = monthlyData[k].income.find(([n]) => n === name)
-                    return <td key={k} className="px-4 py-2 text-right font-mono text-emerald-600">{row ? formatCurrency(row[1]) : '—'}</td>
-                  })}
-                  <td className="px-4 py-2 text-right font-mono font-semibold text-emerald-600">{formatCurrency(total)}</td>
-                </tr>
-              )
-            })
-          })()}
-          <tr className="bg-slate-50 font-semibold">
-            <td className="px-4 py-2 text-slate-900">Total Income</td>
-            {keys.map(k => <td key={k} className="px-4 py-2 text-right font-mono text-emerald-600">{formatCurrency(monthlyData[k].totalIncome)}</td>)}
-            <td className="px-4 py-2 text-right font-mono text-emerald-600">{formatCurrency(keys.reduce((s, k) => s + monthlyData[k].totalIncome, 0))}</td>
-          </tr>
-          {/* Expenses header row */}
-          <tr className="bg-slate-50 cursor-pointer hover:bg-slate-100" onClick={() => setShowExpenses(v => !v)}>
-            <td colSpan={keys.length + 2} className="px-4 py-2 text-xs font-semibold text-slate-500 uppercase tracking-wider">
-              <span className="mr-1.5">{showExpenses ? '▼' : '▶'}</span>Expenses
-            </td>
-          </tr>
-          {showExpenses && (() => {
-            const allExp = new Set(keys.flatMap(k => monthlyData[k].expenses.map(([n]) => n)))
-            return [...allExp].map(name => {
-              const total = keys.reduce((s, k) => {
-                const row = monthlyData[k].expenses.find(([n]) => n === name)
-                return s + (row ? row[1] : 0)
-              }, 0)
-              return (
-                <tr key={name} className="hover:bg-slate-50">
-                  <td className="px-4 py-2 text-slate-700">{name}</td>
-                  {keys.map(k => {
-                    const row = monthlyData[k].expenses.find(([n]) => n === name)
-                    const monthIncome = monthlyData[k].totalIncome
-                    const pct = showPct && row && monthIncome > 0
-                      ? (Math.abs(row[1]) / monthIncome * 100).toFixed(1) + '%'
-                      : null
-                    return (
-                      <td key={k} className="px-4 py-2 text-right font-mono text-red-500">
-                        {row ? (
-                          <span className="inline-flex items-center gap-1.5 justify-end">
-                            {formatCurrency(row[1])}
-                            {pct && <span className="text-slate-400 text-xs">{pct}</span>}
-                          </span>
-                        ) : '—'}
-                      </td>
-                    )
-                  })}
-                  <td className="px-4 py-2 text-right font-mono font-semibold text-red-500">
-                    <span className="inline-flex items-center gap-1.5 justify-end">
-                      {formatCurrency(total)}
-                      {showPct && keys.reduce((s, k) => s + monthlyData[k].totalIncome, 0) > 0 && (
-                        <span className="text-slate-400 text-xs">
-                          {(Math.abs(total) / keys.reduce((s, k) => s + monthlyData[k].totalIncome, 0) * 100).toFixed(1)}%
-                        </span>
-                      )}
-                    </span>
-                  </td>
-                </tr>
-              )
-            })
-          })()}
-          <tr className="bg-slate-50 font-semibold">
-            <td className="px-4 py-2 text-slate-900">Total Expenses</td>
-            {keys.map(k => <td key={k} className="px-4 py-2 text-right font-mono text-red-500">{formatCurrency(monthlyData[k].totalExpenses)}</td>)}
-            <td className="px-4 py-2 text-right font-mono text-red-500">{formatCurrency(keys.reduce((s, k) => s + monthlyData[k].totalExpenses, 0))}</td>
-          </tr>
-          <tr className="border-t-2 border-slate-200">
-            <td className="px-4 py-3 font-bold text-slate-900">NOI</td>
-            {keys.map(k => {
-              const noi = monthlyData[k].noi
-              return <td key={k} className={`px-4 py-3 text-right font-mono font-bold ${noi >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>{formatCurrency(noi)}</td>
-            })}
-            <td className={`px-4 py-3 text-right font-mono font-bold ${keys.reduce((s, k) => s + monthlyData[k].noi, 0) >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>
-              {formatCurrency(keys.reduce((s, k) => s + monthlyData[k].noi, 0))}
-            </td>
-          </tr>
-        </tbody>
-      </table>
+    <div className="print-hide fixed inset-0 z-40 flex justify-end">
+      <div className="absolute inset-0 bg-slate-900/20" onClick={onClose} />
+      <aside className="relative w-full max-w-xl h-full bg-white shadow-xl flex flex-col">
+        <div className="px-5 py-4 border-b border-slate-100 flex items-start justify-between gap-4">
+          <div>
+            <h2 className="font-semibold text-slate-900">{title}</h2>
+            <p className="text-xs text-slate-500 mt-0.5">
+              {subtitle} · {items.length} transaction{items.length !== 1 ? 's' : ''} · net {acct(total, { dollar: true, cents: true })} as booked
+            </p>
+          </div>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-700 text-lg leading-none" aria-label="Close">×</button>
+        </div>
+        <div className="flex-1 overflow-y-auto divide-y divide-slate-100">
+          {sorted.length === 0 && <p className="text-sm text-slate-400 px-5 py-6">No transactions.</p>}
+          {sorted.map(({ t, cat, place }) => {
+            const adj = adjByTx.get(t.id)
+            const info = adj ? treatmentInfo(adj.treatment) : null
+            const partial = isPartial(t, adj)
+            const adjustable = place === 'noi'
+            return (
+              <div key={t.id} className="px-5 py-2.5 flex gap-3">
+                <div className="flex-1 min-w-0">
+                  <p className={`text-sm truncate ${adj && !partial ? 'text-slate-400 line-through' : 'text-slate-800'}`} title={t.description}>
+                    {t.description || '(no description)'}
+                  </p>
+                  <p className="text-xs text-slate-400 mt-0.5">
+                    {t.date}
+                    {showEntity && coName[t.company_id] ? ` · ${coName[t.company_id]}` : ''}
+                    {cat ? ` · ${cat.name}` : ''}
+                    {t.source_type ? ` · ${SOURCE_LABEL[t.source_type] || t.source_type}${t.source ? ` (${t.source})` : ''}` : ''}
+                    {t.is_autopayment ? ' · autopay' : ''}
+                  </p>
+                  {adj && (
+                    <button onClick={() => canAdjust && onAdjust(t)} className="block text-left mt-1" disabled={!canAdjust}>
+                      <span className={`inline-block text-[10px] px-1.5 py-0.5 rounded border ${info.badge}`}>
+                        {info.short} · {acct(excludedAmount(t, adj), { dollar: true, cents: true })} out of NOI
+                      </span>
+                      {adj.reason
+                        ? <span className="block text-xs text-slate-500 italic mt-0.5">{adj.reason}</span>
+                        : <span className="block text-xs text-red-600 mt-0.5">Add a reason</span>}
+                    </button>
+                  )}
+                </div>
+                <div className="text-right flex-shrink-0">
+                  <p className="text-sm tabular-nums text-slate-900">{acct(Number(t.amount), { cents: true })}</p>
+                  {adjustable && canAdjust && !adj && (
+                    <button onClick={() => onAdjust(t)} className="text-xs text-slate-400 hover:text-slate-800 mt-0.5">Adjust</button>
+                  )}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      </aside>
     </div>
   )
 }
