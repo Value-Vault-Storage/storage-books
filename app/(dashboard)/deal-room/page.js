@@ -1,5 +1,5 @@
 'use client'
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect } from 'react'
 import { createClient } from '@/utils/supabase/client'
 import { buildPL, formatCurrency } from '@/lib/reports/pl'
 import { fetchAllRows } from '@/lib/fetchAll'
@@ -7,21 +7,23 @@ import ExportCsvButton from '@/components/ExportCsvButton'
 import { plRows, money, pct, csvFilename } from '@/lib/exportCsv'
 import { loadAdjustments, buildNoiWalk } from '@/lib/reports/adjustments'
 import Link from 'next/link'
+import { groupNoiConfig, inNoi, firstDataMonth, t12Window, monthLabel, periodRange, addMonths } from '@/lib/reports/statement'
 
 const CURRENT_YEAR = new Date().getFullYear()
 const YEARS = [CURRENT_YEAR, CURRENT_YEAR - 1, CURRENT_YEAR - 2]
+const NOW_KEY = `${CURRENT_YEAR}-${String(new Date().getMonth() + 1).padStart(2, '0')}`
 
 export default function DealRoomPage() {
   const [transactions, setTransactions] = useState([])
   const [companies, setCompanies] = useState([])
   const [categories, setCategories] = useState([])
   const [loading, setLoading] = useState(true)
-  const [bankIncludedCats, setBankIncludedCats] = useState(new Set())
+  const [noiConfig, setNoiConfig] = useState({ cats: new Map(), portfolioCats: new Set() })
   const [adjByTx, setAdjByTx] = useState(new Map())
   const [expandedSteps, setExpandedSteps] = useState(new Set())
 
   const [companyFilter, setCompanyFilter] = useState('all')
-  const [year, setYear] = useState(CURRENT_YEAR)
+  const [period, setPeriod] = useState('t12') // 't12' | calendar year
   const [capRate, setCapRate] = useState('')
   const [propertyValue, setPropertyValue] = useState('')
   const [annualize, setAnnualize] = useState(true)
@@ -32,50 +34,55 @@ export default function DealRoomPage() {
 
   async function loadAll() {
     setLoading(true)
-    const [tx, { data: co }, { data: cat }, adj] = await Promise.all([
+    const [tx, { data: co }, { data: cat }, { data: cfg }, adj] = await Promise.all([
       fetchAllRows(() => supabase.from('transactions').select('*, categories(name, type)').order('date')),
       supabase.from('companies').select('*').order('name'),
       supabase.from('categories').select('*').order('sort_order'),
+      supabase.from('bank_pl_categories').select('category_id, company_id'),
       loadAdjustments(supabase),
     ])
     setAdjByTx(adj.byTx)
     setTransactions(tx)
     setCompanies(co || [])
     setCategories(cat || [])
+    setNoiConfig(groupNoiConfig(cfg))
     setLoading(false)
   }
 
-  // Load the Bank P&L config for the selected entity ('all' = portfolio/null),
-  // mirroring the Bank P&L report so the two screens stay in sync.
-  const loadBankConfig = useCallback(async (entityId) => {
-    const isPortfolio = entityId === 'all'
-    const { data: cats } = isPortfolio
-      ? await supabase.from('bank_pl_categories').select('category_id').is('company_id', null)
-      : await supabase.from('bank_pl_categories').select('category_id').eq('company_id', entityId)
-    setBankIncludedCats(new Set((cats || []).map(c => c.category_id)))
-  }, [])
+  // Period: T12 through the latest month with data (what lenders
+  // underwrite), or a calendar year. Either way only months since the books
+  // start count, so a partial history is labeled and annualized honestly.
+  const scopeCo = companyFilter === 'all' ? null : companyFilter
+  const firstKey = firstDataMonth(transactions, scopeCo)
+  const latestKey = transactions.reduce((m, t) => {
+    const k = t.date.slice(0, 7)
+    return k <= NOW_KEY && (!m || k > m) ? k : m
+  }, null) || NOW_KEY
+  let months
+  if (period === 't12') {
+    months = t12Window(latestKey, firstKey).months
+  } else {
+    months = []
+    for (let k = `${period}-01`; k <= `${period}-12`; k = addMonths(k, 1)) {
+      if (firstKey && k >= firstKey && k <= latestKey) months.push(k)
+    }
+  }
+  const monthSet = new Set(months)
+  const periodLabel = months.length ? periodRange({ from: months[0], to: months[months.length - 1] }) : 'No data'
 
-  useEffect(() => { loadBankConfig(companyFilter) }, [companyFilter, loadBankConfig])
+  const filtered = transactions.filter(t =>
+    monthSet.has(t.date.slice(0, 7)) && (!scopeCo || t.company_id === scopeCo))
 
-  const dateFrom = `${year}-01-01`
-  const dateTo = `${year}-12-31`
-
-  let filtered = transactions.filter(t => {
-    if (t.date < dateFrom || t.date > dateTo) return false
-    if (companyFilter !== 'all' && t.company_id !== companyFilter) return false
-    return true
-  })
-
-  // Deal room = Bank P&L checked categories (raw transactions, no source
-  // filter), net of documented NOI adjustments — identical to the Bank P&L
-  // report / Overview NOI. The walk shows reported → adjusted.
-  const reportedTxs = filtered.filter(t => bankIncludedCats.has(t.category_id))
+  // Deal room = the NOI rule used everywhere (each entity's own "What counts
+  // in NOI" selection, else the portfolio default; all sources), net of
+  // documented NOI adjustments. The walk shows reported → adjusted.
+  const reportedTxs = filtered.filter(t => inNoi(noiConfig, t))
   const walk = buildNoiWalk(reportedTxs, categories, adjByTx)
   const pl = walk.adjusted
   const unreviewedCount = walk.steps.find(s => s.treatment.value === 'unreviewed')?.items.length || 0
 
-  // Annualization: count distinct months with data, scale to 12
-  const monthsWithData = new Set(reportedTxs.map(t => t.date.slice(0, 7))).size || 1
+  // Annualization: months covered by the books in this period, scaled to 12
+  const monthsWithData = months.length || 1
   const annFactor = annualize && monthsWithData < 12 ? 12 / monthsWithData : 1
   const isAnnualized = annFactor > 1
 
@@ -94,7 +101,7 @@ export default function DealRoomPage() {
   // CSV export: the normalized P&L as shown, plus the valuation inputs
   function csvRows() {
     const entity = companyFilter === 'all' ? 'All Entities' : companies.find(c => c.id === companyFilter)?.name
-    const label = `${entity} ${year}${isAnnualized ? ` (annualized from ${monthsWithData} months)` : ''}`
+    const label = `${entity} ${periodLabel}${isAnnualized ? ` (annualized from ${monthsWithData} months)` : ''}`
     const rows = plRows([{
       label,
       pl: { income: annIncome, expenses: annExpenses, totalIncome: annTotalIncome, totalExpenses: annTotalExpenses, noi: normalizedNOI },
@@ -119,11 +126,11 @@ export default function DealRoomPage() {
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-xl font-bold text-slate-900">Deal Room</h1>
-          <p className="text-slate-500 text-sm mt-0.5">Normalized P&L for bank submissions and sale underwriting</p>
+          <p className="text-slate-500 text-sm mt-0.5">Normalized P&L for bank submissions and sale underwriting · {periodLabel}</p>
         </div>
         <div className="flex gap-2">
           <ExportCsvButton
-            filename={() => csvFilename('deal-room', companyFilter === 'all' ? 'all-entities' : companies.find(c => c.id === companyFilter)?.name, year)}
+            filename={() => csvFilename('deal-room', companyFilter === 'all' ? 'all-entities' : companies.find(c => c.id === companyFilter)?.name, period === 't12' ? `t12-${latestKey}` : period)}
             getRows={csvRows}
           />
           <button onClick={() => window.print()} className="px-4 py-2 text-sm border border-slate-200 rounded-lg text-slate-600 hover:bg-slate-50">
@@ -146,13 +153,14 @@ export default function DealRoomPage() {
           </select>
         </div>
         <div>
-          <label className="block text-xs font-medium text-slate-500 mb-1">Year</label>
+          <label className="block text-xs font-medium text-slate-500 mb-1">Period</label>
           <select
-            value={year}
-            onChange={e => setYear(Number(e.target.value))}
+            value={period}
+            onChange={e => setPeriod(e.target.value === 't12' ? 't12' : Number(e.target.value))}
             className="border border-slate-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-slate-900"
           >
-            {YEARS.map(y => <option key={y} value={y}>{y}</option>)}
+            <option value="t12">T12 through {monthLabel(latestKey)}</option>
+            {YEARS.map(y => <option key={y} value={y}>Calendar {y}</option>)}
           </select>
         </div>
         <div>
@@ -192,7 +200,10 @@ export default function DealRoomPage() {
         <div className="bg-blue-50 border border-blue-200 rounded-lg px-4 py-2 mb-4 text-sm text-blue-700 flex items-center gap-2">
           <span className="font-semibold">Annualized</span>
           <span className="text-blue-500">—</span>
-          <span>{monthsWithData} month{monthsWithData !== 1 ? 's' : ''} of data scaled to 12 months ({annFactor.toFixed(2)}× factor). All figures below reflect a full-year run rate.</span>
+          <span>
+            {monthsWithData} month{monthsWithData !== 1 ? 's' : ''} of data ({periodLabel}) scaled to 12 months ({annFactor.toFixed(2)}× factor).
+            Annual bills paid outside these months (property tax, insurance renewals) aren&apos;t captured, so check them before sharing a run rate.
+          </span>
         </div>
       )}
 
@@ -281,7 +292,7 @@ export default function DealRoomPage() {
           <div className="flex items-center justify-between mb-3">
             <h3 className="font-semibold text-slate-900">Valuation</h3>
             <span className="text-xs text-slate-400">
-              Based on {isAnnualized ? `annualized NOI (${monthsWithData}mo × ${annFactor.toFixed(2)})` : 'full-year NOI'}
+              Based on {isAnnualized ? `annualized NOI (${monthsWithData}mo × ${annFactor.toFixed(2)})` : `NOI for ${periodLabel}`}
             </span>
           </div>
           <div className="grid grid-cols-2 gap-4">

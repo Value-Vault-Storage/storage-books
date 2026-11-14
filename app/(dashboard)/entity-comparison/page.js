@@ -1,7 +1,9 @@
 'use client'
 import { useState, useEffect } from 'react'
 import { createClient } from '@/utils/supabase/client'
-import { filterTransactions, buildPL, formatCurrency } from '@/lib/reports/pl'
+import { buildPL, formatCurrency } from '@/lib/reports/pl'
+import { loadAdjustments, applyAdjustments } from '@/lib/reports/adjustments'
+import { groupNoiConfig, inNoi } from '@/lib/reports/statement'
 import { fetchAllRows } from '@/lib/fetchAll'
 import ExportCsvButton from '@/components/ExportCsvButton'
 import { plRows, csvFilename } from '@/lib/exportCsv'
@@ -20,6 +22,8 @@ export default function EntityComparisonPage() {
   const [monthTo, setMonthTo] = useState(CURRENT_MONTH)
   const [showPct, setShowPct] = useState(false)
   const [loading, setLoading] = useState(true)
+  const [noiConfig, setNoiConfig] = useState({ cats: new Map(), portfolioCats: new Set() })
+  const [adjByTx, setAdjByTx] = useState(new Map())
 
   const supabase = createClient()
 
@@ -27,11 +31,15 @@ export default function EntityComparisonPage() {
 
   async function loadAll() {
     setLoading(true)
-    const [tx, { data: cat }, { data: co }] = await Promise.all([
+    const [tx, { data: cat }, { data: co }, { data: cfg }, adj] = await Promise.all([
       fetchAllRows(() => supabase.from('transactions').select('*, categories(name, type)').order('date')),
       supabase.from('categories').select('*'),
       supabase.from('companies').select('*').order('name'),
+      supabase.from('bank_pl_categories').select('category_id, company_id'),
+      loadAdjustments(supabase),
     ])
+    setNoiConfig(groupNoiConfig(cfg))
+    setAdjByTx(adj.byTx)
     setTransactions(tx)
     setCategories(cat || [])
     setCompanies(co || [])
@@ -46,7 +54,9 @@ export default function EntityComparisonPage() {
       (companyId ? t.company_id === companyId : true) &&
       t.date >= from && t.date <= to
     )
-    return filterTransactions(base, 'detailed')
+    // Same NOI rule as every other screen: each entity's "What counts in
+    // NOI" selection (else the portfolio default), net of NOI adjustments
+    return applyAdjustments(base.filter(t => inNoi(noiConfig, t)), adjByTx)
   }
 
   const entityPLs = companies.map(co => ({ company: co, pl: buildPL(filteredTx(co.id), categories) }))
@@ -116,7 +126,7 @@ export default function EntityComparisonPage() {
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-xl font-bold text-slate-900">Entity Comparison</h1>
-          <p className="text-slate-500 text-sm mt-0.5">Side-by-side P&L across all entities</p>
+          <p className="text-slate-500 text-sm mt-0.5">Side-by-side NOI across all entities, using What counts in NOI and NOI adjustments</p>
         </div>
         <ExportCsvButton
           filename={() => csvFilename('entity-comparison', year, MONTHS[monthFrom - 1], MONTHS[monthTo - 1])}

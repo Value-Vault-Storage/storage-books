@@ -4,11 +4,13 @@ import { createClient } from '@/utils/supabase/client'
 import { buildPL, formatCurrency } from '@/lib/reports/pl'
 import { fetchAllRows } from '@/lib/fetchAll'
 import { loadAdjustments, applyAdjustments } from '@/lib/reports/adjustments'
+import { inNoi, firstDataMonth, t12Window } from '@/lib/reports/statement'
 import ExportCsvButton from '@/components/ExportCsvButton'
 import { money, pct as csvPct, csvFilename } from '@/lib/exportCsv'
 
 const CURRENT_YEAR = new Date().getFullYear()
 const CURRENT_MONTH = new Date().getMonth() + 1
+const NOW_KEY = `${CURRENT_YEAR}-${String(CURRENT_MONTH).padStart(2, '0')}`
 
 function fmt(n) { return formatCurrency(n || 0) }
 function pct(n, d) { return d > 0 ? `${((n / d) * 100).toFixed(1)}%` : '—' }
@@ -71,25 +73,38 @@ export default function DebtEquityPage() {
     setLoading(false)
   }
 
-  // ── Per-entity NOI (YTD, Bank P&L only) for DSCR ─────────────────
-  // Uses the entity's own Bank P&L selections, falling back to the
-  // portfolio-level config when the entity has none — matching the
-  // Deal Room / Bank P&L report so debt service & non-opex are excluded.
+  // Latest month with transactions (this month may have none yet)
+  const latestKey = transactions.reduce((m, t) => {
+    const k = t.date.slice(0, 7)
+    return k <= NOW_KEY && (!m || k > m) ? k : m
+  }, null) || NOW_KEY
+
+  // ── Per-entity NOI for DSCR: T12, annual-equivalent ───────────────
+  // Same NOI rule as every other screen (the entity's own "What counts in
+  // NOI" selection, else the portfolio default; net of NOI adjustments),
+  // over the trailing 12 months through the latest month with data. With
+  // less than 12 months of history it scales the months it has, so DSCR is
+  // N months of NOI against N months of payments.
   function entityNOI(companyId) {
-    const from = `${CURRENT_YEAR}-01-01`
-    const to   = `${CURRENT_YEAR}-${String(CURRENT_MONTH).padStart(2, '0')}-31`
-    // Use the entity's own categories when it has them; otherwise portfolio.
-    // NOI adjustments apply everywhere.
-    const includedCats = bankConfig.cats.get(companyId) || bankConfig.portfolioCats
-    // Raw transactions filtered to Bank P&L checked items (no source
-    // filter) — identical to the Bank P&L report / Deal Room / Overview.
+    const window = t12Window(latestKey, firstDataMonth(transactions, companyId))
+    if (window.months.length === 0) return 0
+    const keys = new Set(window.months)
     const filtered = transactions.filter(t =>
-      t.company_id === companyId && t.date >= from && t.date <= to &&
-      includedCats.has(t.category_id)
-    )
+      t.company_id === companyId && keys.has(t.date.slice(0, 7)) && inNoi(bankConfig, t))
     const pl = buildPL(applyAdjustments(filtered, bankConfig.adjByTx), categories)
-    // Annualize YTD
-    return CURRENT_MONTH > 0 ? (pl.noi / CURRENT_MONTH) * 12 : pl.noi
+    return pl.noi / window.months.length * 12
+  }
+  // Months of this year's books for an entity (Jan, or the first month with
+  // data, through the latest month with data)
+  function ytdMonths(companyId) {
+    const first = firstDataMonth(transactions, companyId)
+    if (!first || latestKey.slice(0, 4) !== String(CURRENT_YEAR)) return 0
+    const start = first > `${CURRENT_YEAR}-01` ? first : `${CURRENT_YEAR}-01`
+    if (start > latestKey) return 0
+    return Number(latestKey.slice(5, 7)) - Number(start.slice(5, 7)) + 1
+  }
+  function entityNOIMonths(companyId) {
+    return t12Window(latestKey, firstDataMonth(transactions, companyId)).months.length
   }
 
   // ── Actual loan service from transactions (YTD) ──────────────────
@@ -415,11 +430,11 @@ export default function DebtEquityPage() {
                   <div className="px-5 py-3 border-t border-slate-100 bg-slate-50/40 flex items-center gap-6 text-xs text-slate-500">
                     <span className="font-semibold text-slate-600">YTD Loan Service (from transactions)</span>
                     <span className="font-mono font-semibold text-slate-800">{fmt(coActualService)}</span>
-                    <span className="text-slate-400">vs. {fmt(coLoans.reduce((s, l) => s + (parseFloat(l.monthly_payment) || 0), 0) * CURRENT_MONTH)} scheduled</span>
+                    <span className="text-slate-400">vs. {fmt(coLoans.reduce((s, l) => s + (parseFloat(l.monthly_payment) || 0), 0) * ytdMonths(company.id))} scheduled ({ytdMonths(company.id)} mo)</span>
                     {coAnnualDebt > 0 && (
                       <>
                         <span className="text-slate-300">·</span>
-                        <span>DSCR based on annualized {CURRENT_MONTH}-month NOI</span>
+                        <span>DSCR on T12 NOI{entityNOIMonths(company.id) < 12 ? ` (${entityNOIMonths(company.id)} months of history, scaled to 12)` : ''}</span>
                       </>
                     )}
                   </div>

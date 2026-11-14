@@ -9,6 +9,7 @@ import {
 import PrintHeader from '@/components/PrintHeader'
 import ExportCsvButton from '@/components/ExportCsvButton'
 import { csvFilename } from '@/lib/exportCsv'
+import { loadAdjustments } from '@/lib/reports/adjustments'
 import ProFormaTable from '@/components/pro-forma/ProFormaTable'
 import { ManualLineModal, RentIncreaseModal, LineMethodModal } from '@/components/pro-forma/LineItemModal'
 import { Segmented, KpiCard, Delta, Icon } from '@/components/pro-forma/ui'
@@ -29,6 +30,7 @@ export default function ProFormaPage() {
   const [reportSettings, setReportSettings] = useState({})
   const [plans, setPlans] = useState({}) // planKey → { assumptions, overrides }
   const [bankPLCats, setBankPLCats] = useState([]) // default operating categories
+  const [adjByTx, setAdjByTx] = useState(null) // NOI adjustments (null until loaded / legacy)
   const [loading, setLoading] = useState(true)
   const [tableMissing, setTableMissing] = useState(false)
   const [saveStatus, setSaveStatus] = useState(null) // null | 'saving' | 'saved' | 'error'
@@ -45,14 +47,18 @@ export default function ProFormaPage() {
 
   async function loadAll() {
     setLoading(true)
-    const [tx, { data: co }, { data: cat }, { data: branding }, { data: pf, error: pfError }, { data: bpl }] = await Promise.all([
+    const [tx, { data: co }, { data: cat }, { data: branding }, { data: pf, error: pfError }, { data: bpl }, adj] = await Promise.all([
       fetchAllRows(() => supabase.from('transactions').select('*, categories(name, type)').order('date')),
       supabase.from('companies').select('*').order('name'),
       supabase.from('categories').select('*').order('sort_order'),
       supabase.from('report_settings').select('*'),
       supabase.from('pro_forma').select('*'),
       supabase.from('bank_pl_categories').select('company_id, category_id'),
+      loadAdjustments(supabase),
     ])
+    // Legacy exclusions (before the NOI adjustments migration) can't be split,
+    // so keep the old expense_type baseline in that case
+    setAdjByTx(adj.legacy ? null : adj.byTx)
     setTransactions(tx)
     setCompanies(co || [])
     setCategories(cat || [])
@@ -184,7 +190,7 @@ export default function ProFormaPage() {
   }
 
   // ── Compute ──────────────────────────────────────────────────────
-  // Default operating categories: the facility's Bank P&L selection, else the portfolio's
+  // Default operating categories: the facility’s “What counts in NOI” selection, else the portfolio default
   const includedFor = companyId => {
     const own = bankPLCats.filter(r => r.company_id === companyId)
     const rows = own.length ? own : bankPLCats.filter(r => r.company_id === null)
@@ -197,6 +203,7 @@ export default function ProFormaPage() {
       transactions, categories, companyId,
       assumptions: plan.assumptions, overrides: plan.overrides,
       includedCategories: includedFor(companyId),
+      adjByTx,
     })
   }
 
@@ -307,7 +314,7 @@ export default function ProFormaPage() {
           : <>
               Baseline averages {pf.window.label} ({pf.window.count} month{pf.window.count === 1 ? '' : 's'})
               {pf.window.limitedByOperating && ` — ${facilityName} has only ${pf.window.count} operating month${pf.window.count === 1 ? '' : 's'} of history`}
-              . CapEx, one-time, and add-back transactions are excluded. Click a category to see vendors; hover it to switch to an annual or fixed amount; click any month to edit it.
+              . Transactions with NOI adjustments are left out, the same as NOI everywhere else. Click a category to see vendors; hover it to switch to an annual or fixed amount; click any month to edit it.
             </>}
       </p>
 
@@ -342,7 +349,7 @@ export default function ProFormaPage() {
           <div className="px-5 py-3 border-b border-slate-100">
             <h2 className="text-sm font-semibold text-slate-900">Excluded from forecast</h2>
             <p className="text-xs text-slate-500 mt-0.5">
-              Non-operating or one-off categories. Defaults follow your Bank P&L selection{isConsolidated ? '' : ' — include any that belong in operations'}.
+              Non-operating or one-off categories. Defaults follow Settings → What Counts in NOI{isConsolidated ? '' : ' — include any that belong in operations'}.
             </p>
           </div>
           <ul className="divide-y divide-slate-100">
