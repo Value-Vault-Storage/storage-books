@@ -5,6 +5,7 @@ import { createClient } from '@/utils/supabase/client'
 import { buildPL, formatCurrency } from '@/lib/reports/pl'
 import { fetchAllRows } from '@/lib/fetchAll'
 import { loadAdjustments, applyAdjustments } from '@/lib/reports/adjustments'
+import { inNoi, firstDataMonth, t12Window } from '@/lib/reports/statement'
 
 const CURRENT_YEAR = new Date().getFullYear()
 const CURRENT_MONTH = new Date().getMonth() + 1
@@ -101,27 +102,22 @@ export default function DashboardPage() {
   const refYear  = Number(refKey.slice(0, 4))
   const refMonth = Number(refKey.slice(5, 7))
   const refPrev  = refMonth === 1 ? { y: refYear - 1, m: 12 } : { y: refYear, m: refMonth - 1 }
-  const monthsElapsed = refMonth // months of YTD data, for annualizing
 
   // ── NOI = income − operating expenses (Bank P&L checked items) ────
   // A transaction counts only if its category is checked on the Bank P&L
   // net of documented NOI adjustments — same logic as the Bank P&L
   // report / Deal Room. This inherently excludes CapEx and debt service.
-  function bankSetsFor(companyId) {
-    // Per-entity config when it exists; otherwise fall back to portfolio
-    if (companyId && bankConfig.cats.has(companyId)) return bankConfig.cats.get(companyId)
-    return bankConfig.portfolioCats
-  }
-
-  // companyId omitted = global/portfolio; month omitted = full-year YTD
-  function noiPL({ year, month, companyId } = {}) {
-    const inc = bankSetsFor(companyId)
+  // companyId omitted = portfolio (each entity's own selection, summed);
+  // month omitted = full-year YTD; months = explicit list of 'YYYY-MM'
+  function noiPL({ year, month, months, companyId } = {}) {
+    const keys = months ? new Set(months) : null
     const scoped = transactions.filter(t => {
       if (companyId && t.company_id !== companyId) return false
-      const inPeriod = month != null
-        ? t.date.startsWith(monthPrefix(year, month))
-        : t.date.startsWith(`${year}-`)
-      return inPeriod && inc.has(t.category_id)
+      const k = t.date.slice(0, 7)
+      const inPeriod = keys ? keys.has(k)
+        : month != null ? k === monthPrefix(year, month)
+        : k.startsWith(`${year}-`)
+      return inPeriod && inNoi(bankConfig, t)
     })
     return buildPL(applyAdjustments(scoped, bankConfig.adjByTx), categories)
   }
@@ -142,15 +138,19 @@ export default function DashboardPage() {
       .reduce((s, l) => s + (parseFloat(l.monthly_payment) || 0), 0)
   }
 
-  // { monthly, annual } DSCR; null when the scope has no loan obligation
+  // { monthly, annual, months } DSCR; null when the scope has no loan obligation.
+  // "annual" is T12: trailing-12 NOI ÷ 12 months of payments, trimmed to the
+  // months since the books start so a partial year compares like with like.
   function dscrFor(companyId) {
     const debt = monthlyDebt(companyId)
-    if (!(debt > 0)) return { monthly: null, annual: null }
+    if (!(debt > 0)) return { monthly: null, annual: null, months: 0 }
     const monthNOI = noiPL({ year: refYear, month: refMonth, companyId }).noi
-    const ytdNOI   = noiPL({ year: refYear, companyId }).noi
+    const window = t12Window(refKey, firstDataMonth(transactions, companyId))
+    const t12NOI = window.months.length ? noiPL({ months: window.months, companyId }).noi : null
     return {
-      monthly: monthNOI / debt,                                        // ref-month NOI ÷ monthly payment
-      annual: monthsElapsed > 0 ? (ytdNOI / monthsElapsed) / debt : null, // annualized NOI ÷ annual payment
+      monthly: monthNOI / debt,                                              // ref-month NOI ÷ monthly payment
+      annual: t12NOI !== null ? t12NOI / (debt * window.months.length) : null, // T12 NOI ÷ T12 payments
+      months: window.months.length,
     }
   }
 
@@ -260,7 +260,7 @@ export default function DashboardPage() {
                     <p className={`text-2xl font-bold font-mono ${dscrColor(portfolioDSCR.annual)}`}>
                       {portfolioDSCR.annual !== null ? `${portfolioDSCR.annual.toFixed(2)}x` : '—'}
                     </p>
-                    <p className="text-xs text-slate-400">annual</p>
+                    <p className="text-xs text-slate-400">{portfolioDSCR.months === 12 ? 'T12' : `T12 (${portfolioDSCR.months} mo)`}</p>
                   </div>
                   <div>
                     <p className={`text-xl font-bold font-mono ${dscrColor(portfolioDSCR.monthly)}`}>
@@ -317,7 +317,7 @@ export default function DashboardPage() {
                         <span className="text-slate-500">DSCR</span>
                         <span className="font-mono">
                           <span className={dscrColor(coDSCR.annual)}>{coDSCR.annual !== null ? `${coDSCR.annual.toFixed(2)}x` : '—'}</span>
-                          <span className="text-slate-400 text-xs"> yr</span>
+                          <span className="text-slate-400 text-xs"> T12</span>
                           <span className="text-slate-300"> · </span>
                           <span className={dscrColor(coDSCR.monthly)}>{coDSCR.monthly !== null ? `${coDSCR.monthly.toFixed(2)}x` : '—'}</span>
                           <span className="text-slate-400 text-xs"> mo</span>
