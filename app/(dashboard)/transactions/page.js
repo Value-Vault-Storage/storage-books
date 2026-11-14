@@ -6,6 +6,8 @@ import { money, csvFilename } from '@/lib/exportCsv'
 import CommentPanel from '@/components/CommentPanel'
 import SplitModal from '@/components/SplitModal'
 import { fetchAllRows } from '@/lib/fetchAll'
+import AdjustmentModal from '@/components/AdjustmentModal'
+import { loadAdjustments, saveAdjustments, removeAdjustments, treatmentInfo, isPartial } from '@/lib/reports/adjustments'
 
 
 export default function TransactionsPage() {
@@ -34,6 +36,9 @@ export default function TransactionsPage() {
   const [editingId, setEditingId] = useState(null)
   const [commentTxId, setCommentTxId] = useState(null)
   const [splittingTx, setSplittingTx] = useState(null)
+  const [adjByTx, setAdjByTx] = useState(new Map())
+  const [adjLegacy, setAdjLegacy] = useState(false)
+  const [adjEditing, setAdjEditing] = useState(null) // { transactions, existing }
   const [userRole, setUserRole] = useState(null)
 
   // Add transaction modal
@@ -46,13 +51,16 @@ export default function TransactionsPage() {
 
   async function loadAll() {
     setLoading(true)
-    const [tx, { data: co }, { data: cat }, { data: src }, { data: roleData }] = await Promise.all([
+    const [tx, { data: co }, { data: cat }, { data: src }, { data: roleData }, adj] = await Promise.all([
       fetchAllRows(() => supabase.from('transactions').select('*, categories(name, type)').order('date', { ascending: false })),
       supabase.from('companies').select('*').order('name'),
       supabase.from('categories').select('*').order('sort_order'),
       supabase.from('sources').select('*').order('name'),
       supabase.from('user_roles').select('role').single(),
+      loadAdjustments(supabase),
     ])
+    setAdjByTx(adj.byTx)
+    setAdjLegacy(adj.legacy)
     setTransactions(tx)
     setCompanies(co || [])
     setCategories(cat || [])
@@ -98,6 +106,42 @@ export default function TransactionsPage() {
     await supabase.from('transactions').insert(toInsert)
     setSplittingTx(null)
     await loadAll()
+  }
+
+  function openAdjustment(txs) {
+    if (adjLegacy) {
+      alert('Run supabase/migrations/2026-11-14-noi-adjustments.sql in Supabase to start recording NOI adjustments.')
+      return
+    }
+    setAdjEditing({ transactions: txs, existing: txs.length === 1 ? adjByTx.get(txs[0].id) || null : null })
+  }
+
+  function setLocalAdjustments(txs, saved) {
+    setAdjByTx(prev => {
+      const n = new Map(prev)
+      txs.forEach(t => n.delete(t.id))
+      saved.forEach(a => n.set(a.transaction_id, a))
+      return n
+    })
+  }
+
+  async function saveAdjustment(values) {
+    const txs = adjEditing.transactions
+    const { saved, error } = await saveAdjustments(supabase, txs, values)
+    if (error) return error
+    setLocalAdjustments(txs, saved)
+    setAdjEditing(null)
+    setSelected(new Set())
+    return null
+  }
+
+  async function removeAdjustment() {
+    const txs = adjEditing.transactions
+    const { error } = await removeAdjustments(supabase, txs)
+    if (error) return error
+    setLocalAdjustments(txs, [])
+    setAdjEditing(null)
+    return null
   }
 
   async function bulkDelete() {
@@ -332,6 +376,14 @@ export default function TransactionsPage() {
 
               <div className="h-4 w-px bg-slate-200" />
 
+              {/* Bulk NOI adjustment */}
+              <button onClick={() => openAdjustment(transactions.filter(t => selected.has(t.id)))}
+                className="text-xs px-3 py-1.5 border border-slate-200 rounded-lg text-slate-700 hover:bg-slate-50">
+                Exclude from NOI…
+              </button>
+
+              <div className="h-4 w-px bg-slate-200" />
+
               {/* Bulk delete */}
               <button onClick={bulkDelete}
                 className="text-xs px-3 py-1.5 bg-red-600 text-white rounded-lg hover:bg-red-700">
@@ -384,7 +436,19 @@ export default function TransactionsPage() {
                           autoFocus
                           className="border border-slate-300 rounded px-2 py-0.5 text-sm w-full focus:outline-none focus:ring-1 focus:ring-slate-900" />
                       ) : (
-                        <span className="truncate block max-w-xs">{t.description}</span>
+                        <>
+                          <span className="truncate block max-w-xs">{t.description}</span>
+                          {adjByTx.has(t.id) && (() => {
+                            const adj = adjByTx.get(t.id)
+                            const info = treatmentInfo(adj.treatment)
+                            return (
+                              <button onClick={() => isOwner && openAdjustment([t])} title={adj.reason || 'Needs a reason'}
+                                className={`mt-0.5 inline-block text-[10px] px-1.5 py-0.5 rounded border ${info.badge}`}>
+                                Out of NOI · {info.short}{isPartial(t, adj) ? ' (part)' : ''}
+                              </button>
+                            )
+                          })()}
+                        </>
                       )}
                       {t.is_autopayment && <span className="text-xs text-slate-400 ml-1">(autopay)</span>}
                     </td>
@@ -460,6 +524,16 @@ export default function TransactionsPage() {
       </div>
 
       {commentTxId && <CommentPanel transactionId={commentTxId} onClose={() => setCommentTxId(null)} />}
+
+      {adjEditing && (
+        <AdjustmentModal
+          transactions={adjEditing.transactions}
+          existing={adjEditing.existing}
+          onSave={saveAdjustment}
+          onRemove={removeAdjustment}
+          onClose={() => setAdjEditing(null)}
+        />
+      )}
 
       {splittingTx && (
         <SplitModal

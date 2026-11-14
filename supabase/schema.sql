@@ -239,3 +239,23 @@ create table if not exists pro_forma (
 alter table pro_forma enable row level security;
 create policy "authenticated read pro_forma" on pro_forma for select to authenticated using (true);
 create policy "owner write pro_forma" on pro_forma for all to authenticated using (get_my_role() = 'owner');
+
+-- ── NOI adjustments (documented exclusions from NOI) ────────────────────────
+-- See supabase/migrations/2026-11-14-noi-adjustments.sql (also migrates the
+-- old bank_pl_exclusions rows).
+create table if not exists noi_adjustments (
+  id uuid primary key default gen_random_uuid(),
+  transaction_id uuid references transactions(id) on delete cascade not null unique,
+  treatment text not null check (treatment in ('capex', 'non_recurring', 'owner', 'reimbursed', 'unreviewed')),
+  amount decimal(12,2) check (amount is null or amount > 0), -- portion excluded; null = whole transaction
+  reason text not null default '',
+  created_by uuid references auth.users(id) default auth.uid(),
+  created_at timestamptz default now(),
+  updated_at timestamptz default now(),
+  constraint noi_adjustments_reason_required check (treatment = 'unreviewed' or length(trim(reason)) > 0)
+);
+create index if not exists idx_noi_adjustments_transaction on noi_adjustments(transaction_id);
+alter table noi_adjustments enable row level security;
+create policy "authenticated read noi_adjustments" on noi_adjustments for select to authenticated using (true);
+create policy "owner write noi_adjustments" on noi_adjustments for all to authenticated
+  using (get_my_role() = 'owner') with check (get_my_role() = 'owner');

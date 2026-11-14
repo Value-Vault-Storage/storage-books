@@ -3,6 +3,7 @@ import { useState, useEffect } from 'react'
 import { createClient } from '@/utils/supabase/client'
 import { buildPL, formatCurrency } from '@/lib/reports/pl'
 import { fetchAllRows } from '@/lib/fetchAll'
+import { loadAdjustments, applyAdjustments } from '@/lib/reports/adjustments'
 import ExportCsvButton from '@/components/ExportCsvButton'
 import { money, pct as csvPct, csvFilename } from '@/lib/exportCsv'
 
@@ -29,7 +30,7 @@ export default function DebtEquityPage() {
   const [companies, setCompanies] = useState([])
   const [transactions, setTransactions] = useState([])
   const [categories, setCategories] = useState([])
-  const [bankConfig, setBankConfig] = useState({ cats: new Map(), excl: new Map(), portfolioCats: new Set(), portfolioExcl: new Set() })
+  const [bankConfig, setBankConfig] = useState({ cats: new Map(), portfolioCats: new Set(), adjByTx: new Map() })
   const [loading, setLoading] = useState(true)
 
   const [showModal, setShowModal] = useState(false)
@@ -44,13 +45,13 @@ export default function DebtEquityPage() {
 
   async function loadAll() {
     setLoading(true)
-    const [{ data: lo }, { data: co }, tx, { data: cat }, { data: bankCats }, { data: bankExcl }] = await Promise.all([
+    const [{ data: lo }, { data: co }, tx, { data: cat }, { data: bankCats }, adj] = await Promise.all([
       supabase.from('loans').select('*').order('created_at'),
       supabase.from('companies').select('*').order('name'),
       fetchAllRows(() => supabase.from('transactions').select('*, categories(name, type)').order('date')),
       supabase.from('categories').select('*'),
       supabase.from('bank_pl_categories').select('category_id, company_id'),
-      supabase.from('bank_pl_exclusions').select('transaction_id, company_id'),
+      loadAdjustments(supabase),
     ])
     setLoans(lo || [])
     setCompanies(co || [])
@@ -58,19 +59,14 @@ export default function DebtEquityPage() {
     setCategories(cat || [])
 
     // Group Bank P&L config by entity (company_id null = portfolio-level)
-    const cats = new Map(), excl = new Map()
-    const portfolioCats = new Set(), portfolioExcl = new Set()
+    const cats = new Map()
+    const portfolioCats = new Set()
     ;(bankCats || []).forEach(r => {
       if (r.company_id == null) { portfolioCats.add(r.category_id); return }
       if (!cats.has(r.company_id)) cats.set(r.company_id, new Set())
       cats.get(r.company_id).add(r.category_id)
     })
-    ;(bankExcl || []).forEach(r => {
-      if (r.company_id == null) { portfolioExcl.add(r.transaction_id); return }
-      if (!excl.has(r.company_id)) excl.set(r.company_id, new Set())
-      excl.get(r.company_id).add(r.transaction_id)
-    })
-    setBankConfig({ cats, excl, portfolioCats, portfolioExcl })
+    setBankConfig({ cats, portfolioCats, adjByTx: adj.byTx })
 
     setLoading(false)
   }
@@ -82,18 +78,16 @@ export default function DebtEquityPage() {
   function entityNOI(companyId) {
     const from = `${CURRENT_YEAR}-01-01`
     const to   = `${CURRENT_YEAR}-${String(CURRENT_MONTH).padStart(2, '0')}-31`
-    // Use the entity's own config when it has one; otherwise fall back to
-    // portfolio-level — decided atomically so cats & exclusions stay paired.
-    const hasOwnConfig = bankConfig.cats.has(companyId)
-    const includedCats = hasOwnConfig ? bankConfig.cats.get(companyId) : bankConfig.portfolioCats
-    const excludedTxs  = hasOwnConfig ? (bankConfig.excl.get(companyId) || new Set()) : bankConfig.portfolioExcl
+    // Use the entity's own categories when it has them; otherwise portfolio.
+    // NOI adjustments apply everywhere.
+    const includedCats = bankConfig.cats.get(companyId) || bankConfig.portfolioCats
     // Raw transactions filtered to Bank P&L checked items (no source
     // filter) — identical to the Bank P&L report / Deal Room / Overview.
     const filtered = transactions.filter(t =>
       t.company_id === companyId && t.date >= from && t.date <= to &&
-      includedCats.has(t.category_id) && !excludedTxs.has(t.id)
+      includedCats.has(t.category_id)
     )
-    const pl = buildPL(filtered, categories)
+    const pl = buildPL(applyAdjustments(filtered, bankConfig.adjByTx), categories)
     // Annualize YTD
     return CURRENT_MONTH > 0 ? (pl.noi / CURRENT_MONTH) * 12 : pl.noi
   }
