@@ -4,10 +4,10 @@ import Link from 'next/link'
 import { createClient } from '@/utils/supabase/client'
 import { buildPL, formatCurrency } from '@/lib/reports/pl'
 import { fetchAllRows } from '@/lib/fetchAll'
+import { loadAdjustments, applyAdjustments } from '@/lib/reports/adjustments'
 
 const CURRENT_YEAR = new Date().getFullYear()
 const CURRENT_MONTH = new Date().getMonth() + 1
-const EMPTY_SET = new Set()
 
 function monthPrefix(year, month) {
   return `${year}-${String(month).padStart(2, '0')}`
@@ -40,7 +40,7 @@ export default function DashboardPage() {
   const [accounts, setAccounts] = useState([])
   const [balances, setBalances] = useState([])
   const [loans, setLoans] = useState([])
-  const [bankConfig, setBankConfig] = useState({ cats: new Map(), excl: new Map(), portfolioCats: new Set(), portfolioExcl: new Set() })
+  const [bankConfig, setBankConfig] = useState({ cats: new Map(), portfolioCats: new Set(), adjByTx: new Map() })
   const [uncategorized, setUncategorized] = useState(0)
   const [loading, setLoading] = useState(true)
 
@@ -50,7 +50,7 @@ export default function DashboardPage() {
 
   async function loadAll() {
     setLoading(true)
-    const [tx, { data: co }, { data: cat }, { data: acc }, { data: bal }, { data: lo }, { data: bankCats }, { data: bankExcl }] = await Promise.all([
+    const [tx, { data: co }, { data: cat }, { data: acc }, { data: bal }, { data: lo }, { data: bankCats }, adj] = await Promise.all([
       fetchAllRows(() => supabase.from('transactions').select('*, categories(name, type)').order('date', { ascending: false })),
       supabase.from('companies').select('*').order('name'),
       supabase.from('categories').select('*'),
@@ -58,7 +58,7 @@ export default function DashboardPage() {
       supabase.from('monthly_balances').select('*'),
       supabase.from('loans').select('*'),
       supabase.from('bank_pl_categories').select('category_id, company_id'),
-      supabase.from('bank_pl_exclusions').select('transaction_id, company_id'),
+      loadAdjustments(supabase),
     ])
     setTransactions(tx || [])
     setCompanies(co || [])
@@ -68,19 +68,14 @@ export default function DashboardPage() {
     setLoans(lo || [])
 
     // Group Bank P&L config by entity (company_id null = portfolio-level)
-    const cats = new Map(), excl = new Map()
-    const portfolioCats = new Set(), portfolioExcl = new Set()
+    const cats = new Map()
+    const portfolioCats = new Set()
     ;(bankCats || []).forEach(r => {
       if (r.company_id == null) { portfolioCats.add(r.category_id); return }
       if (!cats.has(r.company_id)) cats.set(r.company_id, new Set())
       cats.get(r.company_id).add(r.category_id)
     })
-    ;(bankExcl || []).forEach(r => {
-      if (r.company_id == null) { portfolioExcl.add(r.transaction_id); return }
-      if (!excl.has(r.company_id)) excl.set(r.company_id, new Set())
-      excl.get(r.company_id).add(r.transaction_id)
-    })
-    setBankConfig({ cats, excl, portfolioCats, portfolioExcl })
+    setBankConfig({ cats, portfolioCats, adjByTx: adj.byTx })
 
     setUncategorized((tx || []).filter(t => !t.category_id).length)
     setLoading(false)
@@ -110,27 +105,25 @@ export default function DashboardPage() {
 
   // ── NOI = income − operating expenses (Bank P&L checked items) ────
   // A transaction counts only if its category is checked on the Bank P&L
-  // and it isn't individually excluded — same logic as the Bank P&L
+  // net of documented NOI adjustments — same logic as the Bank P&L
   // report / Deal Room. This inherently excludes CapEx and debt service.
   function bankSetsFor(companyId) {
     // Per-entity config when it exists; otherwise fall back to portfolio
-    if (companyId && bankConfig.cats.has(companyId)) {
-      return { inc: bankConfig.cats.get(companyId), exc: bankConfig.excl.get(companyId) || EMPTY_SET }
-    }
-    return { inc: bankConfig.portfolioCats, exc: bankConfig.portfolioExcl }
+    if (companyId && bankConfig.cats.has(companyId)) return bankConfig.cats.get(companyId)
+    return bankConfig.portfolioCats
   }
 
   // companyId omitted = global/portfolio; month omitted = full-year YTD
   function noiPL({ year, month, companyId } = {}) {
-    const { inc, exc } = bankSetsFor(companyId)
+    const inc = bankSetsFor(companyId)
     const scoped = transactions.filter(t => {
       if (companyId && t.company_id !== companyId) return false
       const inPeriod = month != null
         ? t.date.startsWith(monthPrefix(year, month))
         : t.date.startsWith(`${year}-`)
-      return inPeriod && inc.has(t.category_id) && !exc.has(t.id)
+      return inPeriod && inc.has(t.category_id)
     })
-    return buildPL(scoped, categories)
+    return buildPL(applyAdjustments(scoped, bankConfig.adjByTx), categories)
   }
 
   const monthPL     = noiPL({ year: refYear, month: refMonth })

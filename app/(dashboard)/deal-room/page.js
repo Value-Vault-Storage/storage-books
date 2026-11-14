@@ -5,6 +5,8 @@ import { buildPL, formatCurrency } from '@/lib/reports/pl'
 import { fetchAllRows } from '@/lib/fetchAll'
 import ExportCsvButton from '@/components/ExportCsvButton'
 import { plRows, money, pct, csvFilename } from '@/lib/exportCsv'
+import { loadAdjustments, buildNoiWalk } from '@/lib/reports/adjustments'
+import Link from 'next/link'
 
 const CURRENT_YEAR = new Date().getFullYear()
 const YEARS = [CURRENT_YEAR, CURRENT_YEAR - 1, CURRENT_YEAR - 2]
@@ -15,7 +17,8 @@ export default function DealRoomPage() {
   const [categories, setCategories] = useState([])
   const [loading, setLoading] = useState(true)
   const [bankIncludedCats, setBankIncludedCats] = useState(new Set())
-  const [bankExcludedTxs, setBankExcludedTxs] = useState(new Set())
+  const [adjByTx, setAdjByTx] = useState(new Map())
+  const [expandedSteps, setExpandedSteps] = useState(new Set())
 
   const [companyFilter, setCompanyFilter] = useState('all')
   const [year, setYear] = useState(CURRENT_YEAR)
@@ -29,11 +32,13 @@ export default function DealRoomPage() {
 
   async function loadAll() {
     setLoading(true)
-    const [tx, { data: co }, { data: cat }] = await Promise.all([
+    const [tx, { data: co }, { data: cat }, adj] = await Promise.all([
       fetchAllRows(() => supabase.from('transactions').select('*, categories(name, type)').order('date')),
       supabase.from('companies').select('*').order('name'),
       supabase.from('categories').select('*').order('sort_order'),
+      loadAdjustments(supabase),
     ])
+    setAdjByTx(adj.byTx)
     setTransactions(tx)
     setCompanies(co || [])
     setCategories(cat || [])
@@ -44,16 +49,10 @@ export default function DealRoomPage() {
   // mirroring the Bank P&L report so the two screens stay in sync.
   const loadBankConfig = useCallback(async (entityId) => {
     const isPortfolio = entityId === 'all'
-    const [{ data: cats }, { data: excl }] = await Promise.all([
-      isPortfolio
-        ? supabase.from('bank_pl_categories').select('category_id').is('company_id', null)
-        : supabase.from('bank_pl_categories').select('category_id').eq('company_id', entityId),
-      isPortfolio
-        ? supabase.from('bank_pl_exclusions').select('transaction_id').is('company_id', null)
-        : supabase.from('bank_pl_exclusions').select('transaction_id').eq('company_id', entityId),
-    ])
+    const { data: cats } = isPortfolio
+      ? await supabase.from('bank_pl_categories').select('category_id').is('company_id', null)
+      : await supabase.from('bank_pl_categories').select('category_id').eq('company_id', entityId)
     setBankIncludedCats(new Set((cats || []).map(c => c.category_id)))
-    setBankExcludedTxs(new Set((excl || []).map(e => e.transaction_id)))
   }, [])
 
   useEffect(() => { loadBankConfig(companyFilter) }, [companyFilter, loadBankConfig])
@@ -67,16 +66,16 @@ export default function DealRoomPage() {
     return true
   })
 
-  // Deal room = Bank P&L checked items only (raw transactions, no source
-  // filter) — identical to the Bank P&L report / Overview NOI.
-  const detailedFiltered = filtered.filter(t =>
-    bankIncludedCats.has(t.category_id) && !bankExcludedTxs.has(t.id)
-  )
-
-  const pl = buildPL(detailedFiltered, categories)
+  // Deal room = Bank P&L checked categories (raw transactions, no source
+  // filter), net of documented NOI adjustments — identical to the Bank P&L
+  // report / Overview NOI. The walk shows reported → adjusted.
+  const reportedTxs = filtered.filter(t => bankIncludedCats.has(t.category_id))
+  const walk = buildNoiWalk(reportedTxs, categories, adjByTx)
+  const pl = walk.adjusted
+  const unreviewedCount = walk.steps.find(s => s.treatment.value === 'unreviewed')?.items.length || 0
 
   // Annualization: count distinct months with data, scale to 12
-  const monthsWithData = new Set(detailedFiltered.map(t => t.date.slice(0, 7))).size || 1
+  const monthsWithData = new Set(reportedTxs.map(t => t.date.slice(0, 7))).size || 1
   const annFactor = annualize && monthsWithData < 12 ? 12 / monthsWithData : 1
   const isAnnualized = annFactor > 1
 
@@ -100,6 +99,14 @@ export default function DealRoomPage() {
       label,
       pl: { income: annIncome, expenses: annExpenses, totalIncome: annTotalIncome, totalExpenses: annTotalExpenses, noi: normalizedNOI },
     }])
+    if (walk.steps.length > 0) {
+      rows.push([], ['NOI Walk', label], ['Reported NOI', money(ann(walk.reported.noi))])
+      walk.steps.forEach(step => {
+        rows.push([`${step.treatment.label} (${step.items.length})`, money(ann(step.total))])
+        step.items.forEach(i => rows.push([`  ${i.tx.date} ${i.tx.description || ''} — ${i.adj.reason || 'no reason recorded'}`, money(ann(i.impact))]))
+      })
+      rows.push(['Adjusted NOI', money(normalizedNOI)])
+    }
     if (capRate) rows.push(['Cap Rate %', pct(parseFloat(capRate), 2)], ['Implied Value', money(impliedValue)])
     if (propertyValue) rows.push(['Property Value', money(parseFloat(propertyValue))], ['Cap Rate at Value %', pct(capRateFromValue, 2)])
     return rows
@@ -206,12 +213,67 @@ export default function DealRoomPage() {
         </div>
         <div className={`border rounded-xl p-4 ${normalizedNOI >= 0 ? 'bg-blue-50 border-blue-200' : 'bg-red-50 border-red-200'}`}>
           <p className={`text-xs font-semibold uppercase tracking-wider mb-1 ${normalizedNOI >= 0 ? 'text-blue-700' : 'text-red-700'}`}>
-            Normalized NOI{isAnnualized ? ' (Ann.)' : ''}
+            Adjusted NOI{isAnnualized ? ' (Ann.)' : ''}
           </p>
           <p className={`text-2xl font-bold ${normalizedNOI >= 0 ? 'text-blue-700' : 'text-red-700'}`}>{formatCurrency(normalizedNOI)}</p>
           {isAnnualized && <p className={`text-xs mt-1 ${normalizedNOI >= 0 ? 'text-blue-600' : 'text-red-600'}`}>Actual: {formatCurrency(pl.noi)}</p>}
         </div>
       </div>
+
+      {/* Reported → adjusted NOI walk */}
+      {walk.steps.length > 0 && (
+        <div className="bg-white rounded-xl border border-slate-200 p-5 mb-6">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="font-semibold text-slate-900">NOI Walk</h3>
+            <Link href="/adjustments" className="print-hide text-xs text-slate-500 hover:text-slate-900 underline">Edit adjustments →</Link>
+          </div>
+          {unreviewedCount > 0 && (
+            <p className="print-hide text-xs text-red-600 mb-3">
+              {unreviewedCount} adjustment{unreviewedCount !== 1 ? 's have' : ' has'} no reason. Lenders and buyers usually reject undocumented add-backs.
+            </p>
+          )}
+          <div className="text-sm">
+            <div className="flex justify-between py-1">
+              <span className="text-slate-700">Reported NOI{isAnnualized ? ' (Ann.)' : ''}</span>
+              <span className="font-mono">{formatCurrency(ann(walk.reported.noi))}</span>
+            </div>
+            {walk.steps.map(step => {
+              const open = expandedSteps.has(step.treatment.value)
+              return (
+                <div key={step.treatment.value} className="border-t border-slate-100">
+                  <button
+                    onClick={() => setExpandedSteps(prev => { const n = new Set(prev); n.has(step.treatment.value) ? n.delete(step.treatment.value) : n.add(step.treatment.value); return n })}
+                    className="w-full flex justify-between py-1.5 text-left hover:bg-slate-50">
+                    <span className="text-slate-600">
+                      <span className="print-hide text-xs text-slate-400 mr-1">{open ? '▼' : '▶'}</span>
+                      {step.treatment.label} <span className="text-slate-400">({step.items.length})</span>
+                    </span>
+                    <span className="font-mono text-slate-700">{step.total >= 0 ? '+' : ''}{formatCurrency(ann(step.total))}</span>
+                  </button>
+                  {open && (
+                    <div className="pl-5 pb-2 space-y-1.5">
+                      {step.items.map(i => (
+                        <div key={i.tx.id} className="flex justify-between gap-4 text-xs">
+                          <div className="min-w-0">
+                            <p className="text-slate-600 truncate">{i.tx.date} · {i.tx.description} <span className="text-slate-400">· {i.category}</span></p>
+                            <p className={i.adj.reason ? 'text-slate-500 italic' : 'text-red-500'}>{i.adj.reason || 'No reason recorded'}</p>
+                          </div>
+                          <span className="font-mono text-slate-600 whitespace-nowrap">{i.impact >= 0 ? '+' : ''}{formatCurrency(i.impact)}</span>
+                        </div>
+                      ))}
+                      {isAnnualized && <p className="text-[11px] text-slate-400">Items shown at actual amounts; the group total is annualized.</p>}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+            <div className="flex justify-between py-1.5 border-t-2 border-slate-200 font-semibold">
+              <span>Adjusted NOI{isAnnualized ? ' (Ann.)' : ''}</span>
+              <span className="font-mono">{formatCurrency(normalizedNOI)}</span>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Valuation */}
       {(impliedValue || capRateFromValue) && (
@@ -244,7 +306,7 @@ export default function DealRoomPage() {
       <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
         <div className="px-5 py-4 border-b border-slate-100 bg-slate-50">
           <h2 className="font-semibold text-slate-900 text-sm">P&L Statement</h2>
-          <p className="text-xs text-slate-500 mt-0.5">Detailed accrual view — for bank & buyer review</p>
+          <p className="text-xs text-slate-500 mt-0.5">Cash basis, net of documented NOI adjustments — for bank & buyer review</p>
         </div>
         <div className="p-5 space-y-4">
           <div>

@@ -6,6 +6,12 @@ import { fetchAllRows } from '@/lib/fetchAll'
 import PrintHeader from '@/components/PrintHeader'
 import ExportCsvButton from '@/components/ExportCsvButton'
 import { plRows, csvFilename } from '@/lib/exportCsv'
+import AdjustmentModal from '@/components/AdjustmentModal'
+import {
+  loadAdjustments, applyAdjustments, saveAdjustments, removeAdjustments,
+  treatmentInfo, excludedAmount, isPartial,
+} from '@/lib/reports/adjustments'
+import Link from 'next/link'
 
 const CURRENT_YEAR = new Date().getFullYear()
 const YEARS = [CURRENT_YEAR, CURRENT_YEAR - 1, CURRENT_YEAR - 2]
@@ -33,8 +39,12 @@ export default function PLPage() {
   // Bank P&L state
   const [bankEntity, setBankEntity] = useState('portfolio')
   const [bankIncludedCats, setBankIncludedCats] = useState(new Set())
-  const [bankExcludedTxs, setBankExcludedTxs] = useState(new Set())
   const [expandedBankCats, setExpandedBankCats] = useState(new Set())
+
+  // NOI adjustments (apply in every view, not per entity)
+  const [adjByTx, setAdjByTx] = useState(new Map())
+  const [adjLegacy, setAdjLegacy] = useState(false)
+  const [adjEditing, setAdjEditing] = useState(null) // { transactions, existing }
 
   const supabase = createClient()
 
@@ -42,12 +52,15 @@ export default function PLPage() {
 
   async function loadAll() {
     setLoading(true)
-    const [tx, { data: co }, { data: cat }, { data: branding }] = await Promise.all([
+    const [tx, { data: co }, { data: cat }, { data: branding }, adj] = await Promise.all([
       fetchAllRows(() => supabase.from('transactions').select('*, categories(name, type)').order('date')),
       supabase.from('companies').select('*').order('name'),
       supabase.from('categories').select('*').order('sort_order'),
       supabase.from('report_settings').select('*'),
+      loadAdjustments(supabase),
     ])
+    setAdjByTx(adj.byTx)
+    setAdjLegacy(adj.legacy)
     setTransactions(tx)
     setCompanies(co || [])
     setCategories(cat || [])
@@ -58,16 +71,10 @@ export default function PLPage() {
   // Load saved Bank P&L config when entity changes
   const loadBankConfig = useCallback(async (entityId) => {
     const isPortfolio = entityId === 'portfolio'
-    const [{ data: cats }, { data: excl }] = await Promise.all([
-      isPortfolio
-        ? supabase.from('bank_pl_categories').select('category_id').is('company_id', null)
-        : supabase.from('bank_pl_categories').select('category_id').eq('company_id', entityId),
-      isPortfolio
-        ? supabase.from('bank_pl_exclusions').select('transaction_id').is('company_id', null)
-        : supabase.from('bank_pl_exclusions').select('transaction_id').eq('company_id', entityId),
-    ])
+    const { data: cats } = isPortfolio
+      ? await supabase.from('bank_pl_categories').select('category_id').is('company_id', null)
+      : await supabase.from('bank_pl_categories').select('category_id').eq('company_id', entityId)
     setBankIncludedCats(new Set((cats || []).map(c => c.category_id)))
-    setBankExcludedTxs(new Set((excl || []).map(e => e.transaction_id)))
     setExpandedBankCats(new Set())
   }, [])
 
@@ -86,24 +93,17 @@ export default function PLPage() {
         : supabase.from('bank_pl_categories').delete().eq('category_id', categoryId).is('company_id', null)
       await q
       setBankIncludedCats(prev => { const n = new Set(prev); n.delete(categoryId); return n })
-      // Remove opex tag + any exclusions from all transactions in this category
+      // Remove the opex tag from this category's transactions. NOI
+      // adjustments are kept: they document the transaction itself.
       const txInCat = transactions.filter(t =>
         t.category_id === categoryId &&
-        (!companyId || t.company_id === companyId)
+        (!companyId || t.company_id === companyId) &&
+        !adjByTx.has(t.id)
       )
-      if (txInCat.length > 0) {
+      if (txInCat.length > 0 && cat?.type === 'expense') {
         const ids = txInCat.map(t => t.id)
-        // Remove opex tag
-        if (cat?.type === 'expense') {
-          await supabase.from('transactions').update({ expense_type: null }).in('id', ids)
-          setTransactions(prev => prev.map(t => ids.includes(t.id) ? { ...t, expense_type: null } : t))
-        }
-        // Remove exclusions
-        const eq = companyId
-          ? supabase.from('bank_pl_exclusions').delete().in('transaction_id', ids).eq('company_id', companyId)
-          : supabase.from('bank_pl_exclusions').delete().in('transaction_id', ids).is('company_id', null)
-        await eq
-        setBankExcludedTxs(prev => { const n = new Set(prev); ids.forEach(id => n.delete(id)); return n })
+        await supabase.from('transactions').update({ expense_type: null }).in('id', ids)
+        setTransactions(prev => prev.map(t => ids.includes(t.id) ? { ...t, expense_type: null } : t))
       }
     } else {
       // Add category to Bank P&L
@@ -114,7 +114,8 @@ export default function PLPage() {
         const txToTag = transactions.filter(t =>
           t.category_id === categoryId &&
           t.amount < 0 &&
-          (!companyId || t.company_id === companyId)
+          (!companyId || t.company_id === companyId) &&
+          !adjByTx.has(t.id)
         )
         if (txToTag.length > 0) {
           const ids = txToTag.map(t => t.id)
@@ -125,24 +126,41 @@ export default function PLPage() {
     }
   }
 
-  async function toggleBankTransaction(txId) {
-    const companyId = bankEntity === 'portfolio' ? null : bankEntity
-    if (bankExcludedTxs.has(txId)) {
-      // Re-include: remove from exclusions + restore opex tag
-      const q = companyId
-        ? supabase.from('bank_pl_exclusions').delete().eq('transaction_id', txId).eq('company_id', companyId)
-        : supabase.from('bank_pl_exclusions').delete().eq('transaction_id', txId).is('company_id', null)
-      await q
-      await supabase.from('transactions').update({ expense_type: 'opex' }).eq('id', txId)
-      setTransactions(prev => prev.map(t => t.id === txId ? { ...t, expense_type: 'opex' } : t))
-      setBankExcludedTxs(prev => { const n = new Set(prev); n.delete(txId); return n })
-    } else {
-      // Exclude: add to exclusions + remove opex tag
-      await supabase.from('bank_pl_exclusions').insert({ transaction_id: txId, company_id: companyId })
-      await supabase.from('transactions').update({ expense_type: null }).eq('id', txId)
-      setTransactions(prev => prev.map(t => t.id === txId ? { ...t, expense_type: null } : t))
-      setBankExcludedTxs(prev => new Set([...prev, txId]))
+  // Clicking a transaction's checkbox opens the adjustment dialog: a reason
+  // is required to take anything out of NOI.
+  function editAdjustment(t) {
+    if (adjLegacy) {
+      alert('Run supabase/migrations/2026-11-14-noi-adjustments.sql in Supabase to start recording NOI adjustments.')
+      return
     }
+    setAdjEditing({ transactions: [t], existing: adjByTx.get(t.id) || null })
+  }
+
+  function applyLocalAdjustments(txs, saved) {
+    setAdjByTx(prev => {
+      const n = new Map(prev)
+      txs.forEach(t => n.delete(t.id))
+      saved.forEach(a => n.set(a.transaction_id, a))
+      return n
+    })
+  }
+
+  async function saveAdjustment(values) {
+    const txs = adjEditing.transactions
+    const { saved, error } = await saveAdjustments(supabase, txs, values)
+    if (error) return error
+    applyLocalAdjustments(txs, saved)
+    setAdjEditing(null)
+    return null
+  }
+
+  async function removeAdjustment() {
+    const txs = adjEditing.transactions
+    const { error } = await removeAdjustments(supabase, txs)
+    if (error) return error
+    applyLocalAdjustments(txs, [])
+    setAdjEditing(null)
+    return null
   }
 
   function toggleExpandBankCat(catId) {
@@ -171,10 +189,11 @@ export default function PLPage() {
     if (bankEntity !== 'portfolio' && t.company_id !== bankEntity) return false
     return true
   })
-  const bankFiltered = bankDateFiltered.filter(t =>
-    bankIncludedCats.has(t.category_id) && !bankExcludedTxs.has(t.id)
-  )
-  const bankPL = buildPL(bankFiltered, categories)
+  const bankReportedTxs = bankDateFiltered.filter(t => bankIncludedCats.has(t.category_id))
+  const bankPL = buildPL(applyAdjustments(bankReportedTxs, adjByTx), categories)
+  const bankReportedPL = buildPL(bankReportedTxs, categories)
+  const bankAdjCount = bankReportedTxs.filter(t => adjByTx.has(t.id)).length
+  const bankUnreviewed = bankReportedTxs.filter(t => adjByTx.get(t.id)?.treatment === 'unreviewed').length
 
   // Transactions per category for Bank P&L drill-down (for config panel)
   function txsForBankCategory(catId) {
@@ -341,7 +360,7 @@ export default function PLPage() {
               <div className="mt-2">
                 <p className="text-xs text-slate-400">
                   {bankIncludedCats.size} categor{bankIncludedCats.size === 1 ? 'y' : 'ies'} selected
-                  {bankExcludedTxs.size > 0 && `, ${bankExcludedTxs.size} excluded`}
+                  {bankAdjCount > 0 && `, ${bankAdjCount} adjusted`}
                 </p>
               </div>
             </div>
@@ -372,21 +391,9 @@ export default function PLPage() {
                         </div>
                         {included && expanded && txs.length > 0 && (
                           <div className="ml-6 mt-1 mb-2 space-y-0.5 border-l-2 border-slate-100 pl-3">
-                            {txs.map(t => {
-                              const excluded = bankExcludedTxs.has(t.id)
-                              return (
-                                <div key={t.id} className="flex items-start gap-2 py-1">
-                                  <input type="checkbox" checked={!excluded} onChange={() => toggleBankTransaction(t.id)}
-                                    className="mt-0.5 rounded border-slate-300 text-slate-900 focus:ring-slate-900" />
-                                  <div className="flex-1 min-w-0">
-                                    <p className={`text-xs truncate ${excluded ? 'text-slate-300 line-through' : 'text-slate-600'}`}>
-                                      {t.description}
-                                    </p>
-                                    <p className="text-xs text-slate-400">{t.date} · {formatCurrency(Math.abs(t.amount))}</p>
-                                  </div>
-                                </div>
-                              )
-                            })}
+                            {txs.map(t => (
+                              <BankTxRow key={t.id} t={t} adj={adjByTx.get(t.id)} onEdit={() => editAdjustment(t)} />
+                            ))}
                           </div>
                         )}
                       </div>
@@ -420,21 +427,9 @@ export default function PLPage() {
                         </div>
                         {included && expanded && txs.length > 0 && (
                           <div className="ml-6 mt-1 mb-2 space-y-0.5 border-l-2 border-slate-100 pl-3">
-                            {txs.map(t => {
-                              const excluded = bankExcludedTxs.has(t.id)
-                              return (
-                                <div key={t.id} className="flex items-start gap-2 py-1">
-                                  <input type="checkbox" checked={!excluded} onChange={() => toggleBankTransaction(t.id)}
-                                    className="mt-0.5 rounded border-slate-300 text-slate-900 focus:ring-slate-900" />
-                                  <div className="flex-1 min-w-0">
-                                    <p className={`text-xs truncate ${excluded ? 'text-slate-300 line-through' : 'text-slate-600'}`}>
-                                      {t.description}
-                                    </p>
-                                    <p className="text-xs text-slate-400">{t.date} · {formatCurrency(Math.abs(t.amount))}</p>
-                                  </div>
-                                </div>
-                              )
-                            })}
+                            {txs.map(t => (
+                              <BankTxRow key={t.id} t={t} adj={adjByTx.get(t.id)} onEdit={() => editAdjustment(t)} />
+                            ))}
                           </div>
                         )}
                       </div>
@@ -449,6 +444,28 @@ export default function PLPage() {
           <div className="flex-1">
             <PLTable pl={bankPL} showPct={showPct}
               title={bankEntity === 'portfolio' ? 'Portfolio — Bank P&L' : (companies.find(c => c.id === bankEntity)?.name + ' — Bank P&L')} />
+            {bankAdjCount > 0 && (
+              <div className="mt-4 bg-white rounded-xl border border-slate-200 px-6 py-4 text-sm">
+                <div className="flex justify-between">
+                  <span className="text-slate-600">Reported NOI (before adjustments)</span>
+                  <span className="font-mono text-slate-700">{formatCurrency(bankReportedPL.noi)}</span>
+                </div>
+                <div className="flex justify-between mt-1">
+                  <span className="text-slate-600">NOI adjustments ({bankAdjCount})</span>
+                  <span className="font-mono text-slate-700">{bankPL.noi - bankReportedPL.noi >= 0 ? '+' : ''}{formatCurrency(bankPL.noi - bankReportedPL.noi)}</span>
+                </div>
+                <div className="flex justify-between mt-1 pt-2 border-t border-slate-100 font-semibold">
+                  <span>Adjusted NOI (shown above)</span>
+                  <span className="font-mono">{formatCurrency(bankPL.noi)}</span>
+                </div>
+                <div className="print-hide mt-3 flex items-center justify-between">
+                  {bankUnreviewed > 0
+                    ? <span className="text-xs text-red-600">{bankUnreviewed} adjustment{bankUnreviewed !== 1 ? 's' : ''} need a reason</span>
+                    : <span />}
+                  <Link href="/adjustments" className="text-xs text-slate-500 hover:text-slate-900 underline">Review all adjustments →</Link>
+                </div>
+              </div>
+            )}
             {bankIncludedCats.size === 0 && (
               <p className="text-sm text-slate-400 mt-4 text-center">
                 Select categories on the left to build your Bank P&L.
@@ -469,6 +486,45 @@ export default function PLPage() {
         <PLTable pl={pl} showPct={showPct} title={companyFilter === 'all' ? 'Consolidated' : companies.find(c => c.id === companyFilter)?.name} />
       )}
       </div>{/* end print-area */}
+
+      {adjEditing && (
+        <AdjustmentModal
+          transactions={adjEditing.transactions}
+          existing={adjEditing.existing}
+          onSave={saveAdjustment}
+          onRemove={removeAdjustment}
+          onClose={() => setAdjEditing(null)}
+        />
+      )}
+    </div>
+  )
+}
+
+// One transaction in the Bank P&L drill-down. Unchecked = adjusted out of NOI.
+function BankTxRow({ t, adj, onEdit }) {
+  const partial = isPartial(t, adj)
+  const info = adj ? treatmentInfo(adj.treatment) : null
+  return (
+    <div className="flex items-start gap-2 py-1">
+      <input type="checkbox" checked={!adj || partial} onChange={onEdit}
+        title={adj ? 'Edit NOI adjustment' : 'Exclude from NOI'}
+        className="mt-0.5 rounded border-slate-300 text-slate-900 focus:ring-slate-900" />
+      <div className="flex-1 min-w-0">
+        <p className={`text-xs truncate ${adj && !partial ? 'text-slate-300 line-through' : 'text-slate-600'}`}>
+          {t.description}
+        </p>
+        <p className="text-xs text-slate-400">{t.date} · {formatCurrency(Math.abs(t.amount))}</p>
+        {adj && (
+          <button onClick={onEdit} className="block text-left mt-0.5 w-full">
+            <span className={`inline-block text-[10px] px-1.5 py-0.5 rounded border ${info.badge}`}>
+              {info.short}{partial ? ` · ${formatCurrency(excludedAmount(t, adj))} out` : ''}
+            </span>
+            {adj.reason
+              ? <span className="block text-xs text-slate-500 italic mt-0.5 line-clamp-2">{adj.reason}</span>
+              : <span className="block text-xs text-red-500 mt-0.5">Add a reason</span>}
+          </button>
+        )}
+      </div>
     </div>
   )
 }
