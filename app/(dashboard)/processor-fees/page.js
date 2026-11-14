@@ -1,5 +1,5 @@
 'use client'
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import Link from 'next/link'
 import Papa from 'papaparse'
 import { createClient } from '@/utils/supabase/client'
@@ -37,6 +37,11 @@ export default function ProcessorFeesPage() {
   const [preview, setPreview] = useState(null) // { files, months: [{ month, fee, deposits }] }
   const [applying, setApplying] = useState(false)
 
+  // Latest settings and a save queue, so changing two entities quickly
+  // can't let an older save overwrite a newer one
+  const settingsRef = useRef({})
+  const saveChain = useRef(Promise.resolve())
+
   useEffect(() => { loadAll() }, [])
 
   async function loadAll() {
@@ -54,6 +59,7 @@ export default function ProcessorFeesPage() {
     setNoiConfig(groupNoiConfig(cfg))
     setIsOwner(role?.role === 'owner')
     setSettings(s)
+    settingsRef.current = s
     setFees(f.fees)
     if (f.error) setError(f.error)
     setLoading(false)
@@ -65,11 +71,14 @@ export default function ProcessorFeesPage() {
     if (f.error) setError(f.error)
   }
 
-  async function setProcessor(companyId, value) {
-    const next = { ...settings, [companyId]: value }
+  function setProcessor(companyId, value) {
+    const next = { ...settingsRef.current, [companyId]: value }
+    settingsRef.current = next
     setSettings(next)
-    const err = await saveProcessorSettings(supabase, next)
-    if (err) setError(err)
+    saveChain.current = saveChain.current.then(async () => {
+      const err = await saveProcessorSettings(supabase, settingsRef.current)
+      if (err) setError(err)
+    })
   }
 
   const cats = feeCategories(categories)
