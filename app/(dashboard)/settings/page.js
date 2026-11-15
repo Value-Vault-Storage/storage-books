@@ -2,12 +2,14 @@
 import { useState, useEffect } from 'react'
 import { createClient } from '@/utils/supabase/client'
 import NoiCategoriesPanel from '@/components/settings/NoiCategoriesPanel'
+import AccountMapPanel from '@/components/settings/AccountMapPanel'
 
 const MATCH_TYPE_LABELS = { contains: 'Contains', starts_with: 'Starts with', exact: 'Exact match' }
 
 const TABS = [
   { id: 'accounts', label: 'Chart of Accounts' },
   { id: 'noi', label: 'What Counts in NOI' },
+  { id: 'map', label: 'Where Categories Go' },
   { id: 'rules', label: 'Auto-Categorization' },
   { id: 'sources', label: 'Transaction Sources' },
   { id: 'entities', label: 'Companies / Entities' },
@@ -372,6 +374,10 @@ export default function SettingsPage() {
 
           {activeTab === 'noi' && (
             <NoiCategoriesPanel companies={companies} categories={categories} isOwner={isOwner} />
+          )}
+
+          {activeTab === 'map' && (
+            <AccountMapPanel categories={categories} isOwner={isOwner} />
           )}
 
           {/* ── Auto-Categorization Rules ─────────────────────────── */}
