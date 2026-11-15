@@ -5,6 +5,7 @@ import { buildPL, formatCurrency } from '@/lib/reports/pl'
 import { fetchAllRows } from '@/lib/fetchAll'
 import { loadAdjustments, applyAdjustments } from '@/lib/reports/adjustments'
 import { inNoi, firstDataMonth, t12Window } from '@/lib/reports/statement'
+import { loadLoanAnchors, saveLoanAnchor, rollForward } from '@/lib/reports/loans'
 import ExportCsvButton from '@/components/ExportCsvButton'
 import { money, pct as csvPct, csvFilename } from '@/lib/exportCsv'
 
@@ -20,6 +21,7 @@ const EMPTY_LOAN = {
   lender_name: '',
   original_balance: '',
   current_balance: '',
+  balance_as_of: '',
   interest_rate: '',
   monthly_payment: '',
   property_value: '',
@@ -34,6 +36,8 @@ export default function DebtEquityPage() {
   const [categories, setCategories] = useState([])
   const [bankConfig, setBankConfig] = useState({ cats: new Map(), portfolioCats: new Set(), adjByTx: new Map() })
   const [loading, setLoading] = useState(true)
+  const [anchors, setAnchors] = useState({}) // loanId → statement date
+  const [saveError, setSaveError] = useState('')
 
   const [showModal, setShowModal] = useState(false)
   const [editingLoan, setEditingLoan] = useState(null) // null = add, obj = edit
@@ -47,14 +51,16 @@ export default function DebtEquityPage() {
 
   async function loadAll() {
     setLoading(true)
-    const [{ data: lo }, { data: co }, tx, { data: cat }, { data: bankCats }, adj] = await Promise.all([
+    const [{ data: lo }, { data: co }, tx, { data: cat }, { data: bankCats }, adj, anc] = await Promise.all([
       supabase.from('loans').select('*').order('created_at'),
       supabase.from('companies').select('*').order('name'),
       fetchAllRows(() => supabase.from('transactions').select('*, categories(name, type)').order('date')),
       supabase.from('categories').select('*'),
       supabase.from('bank_pl_categories').select('category_id, company_id'),
       loadAdjustments(supabase),
+      loadLoanAnchors(supabase),
     ])
+    setAnchors(anc)
     setLoans(lo || [])
     setCompanies(co || [])
     setTransactions(tx || [])
@@ -127,9 +133,20 @@ export default function DebtEquityPage() {
     return total > 0 ? total : null
   }
 
+  // ── Balance roll-forward: statement balance − principal paid since ──
+  function balanceOf(loan) {
+    return rollForward({
+      loan,
+      asOf: anchors[loan.id],
+      loansInEntity: loans.filter(l => l.company_id === loan.company_id).length,
+      transactions,
+      categories,
+    })
+  }
+
   // ── Derived loan metrics ─────────────────────────────────────────
   function loanMetrics(loan) {
-    const balance = parseFloat(loan.current_balance) || 0
+    const balance = balanceOf(loan).balance
     const rate    = parseFloat(loan.interest_rate) || 0
     const payment = parseFloat(loan.monthly_payment) || 0
     const propVal = parseFloat(loan.property_value) || 0
@@ -144,8 +161,8 @@ export default function DebtEquityPage() {
   }
 
   // ── Portfolio totals ─────────────────────────────────────────────
-  const portfolioDebt   = loans.reduce((s, l) => s + (parseFloat(l.current_balance) || 0), 0)
-  const portfolioEquity = loans.reduce((s, l) => s + ((parseFloat(l.property_value) || 0) - (parseFloat(l.current_balance) || 0)), 0)
+  const portfolioDebt   = loans.reduce((s, l) => s + balanceOf(l).balance, 0)
+  const portfolioEquity = loans.reduce((s, l) => s + ((parseFloat(l.property_value) || 0) - balanceOf(l).balance), 0)
   const portfolioValue  = loans.reduce((s, l) => s + (parseFloat(l.property_value) || 0), 0)
   const portfolioLTV    = portfolioValue > 0 ? portfolioDebt / portfolioValue * 100 : null
   const portfolioMonthlyService = loans.reduce((s, l) => s + (parseFloat(l.monthly_payment) || 0), 0)
@@ -164,6 +181,7 @@ export default function DebtEquityPage() {
       lender_name:      loan.lender_name || '',
       original_balance: loan.original_balance ?? '',
       current_balance:  loan.current_balance ?? '',
+      balance_as_of:    anchors[loan.id] || '',
       interest_rate:    loan.interest_rate ?? '',
       monthly_payment:  loan.monthly_payment ?? '',
       property_value:   loan.property_value ?? '',
@@ -176,6 +194,7 @@ export default function DebtEquityPage() {
   async function saveForm() {
     if (!form.lender_name.trim() || !form.company_id) return
     setSaving(true)
+    setSaveError('')
     const payload = {
       company_id:       form.company_id,
       lender_name:      form.lender_name.trim(),
@@ -187,10 +206,18 @@ export default function DebtEquityPage() {
       maturity_date:    form.maturity_date || null,
       notes:            form.notes.trim() || null,
     }
+    let loanId = editingLoan?.id
     if (editingLoan) {
-      await supabase.from('loans').update(payload).eq('id', editingLoan.id)
+      const { error } = await supabase.from('loans').update(payload).eq('id', editingLoan.id)
+      if (error) { setSaveError(error.message); setSaving(false); return }
     } else {
-      await supabase.from('loans').insert(payload)
+      const { data, error } = await supabase.from('loans').insert(payload).select('id').single()
+      if (error) { setSaveError(error.message); setSaving(false); return }
+      loanId = data?.id
+    }
+    if (loanId && (form.balance_as_of || '') !== (anchors[loanId] || '')) {
+      const err = await saveLoanAnchor(supabase, loanId, form.balance_as_of || null)
+      if (err) { setSaveError(err); setSaving(false); return }
     }
     setShowModal(false)
     setForm(EMPTY_LOAN)
@@ -209,7 +236,8 @@ export default function DebtEquityPage() {
   function csvRows() {
     const num = v => (v === null || v === undefined || v === '' ? '' : money(parseFloat(v)))
     const rows = [[
-      'Entity', 'Lender', 'Original Balance', 'Current Balance', 'Rate %', 'Monthly Payment',
+      'Entity', 'Lender', 'Original Balance', 'Current Balance', 'Statement Balance', 'Statement Date',
+      'Principal Paid Since', 'Rate %', 'Monthly Payment',
       'Monthly Principal', 'Monthly Interest', 'Property Value', 'Equity', 'LTV %',
       'Annual Debt Service', 'Entity DSCR', 'Maturity Date', 'Notes',
     ]]
@@ -220,7 +248,8 @@ export default function DebtEquityPage() {
       coLoans.forEach(loan => {
         const m = loanMetrics(loan)
         rows.push([
-          company.name, loan.lender_name, num(loan.original_balance), num(loan.current_balance),
+          company.name, loan.lender_name, num(loan.original_balance), money(balanceOf(loan).balance),
+          num(loan.current_balance), anchors[loan.id] || '', balanceOf(loan).status === 'ok' ? money(balanceOf(loan).principalSince) : '',
           loan.interest_rate ? csvPct(parseFloat(loan.interest_rate), 3) : '', num(loan.monthly_payment),
           loan.monthly_payment ? money(m.monthlyPrincipal) : '', loan.monthly_payment ? money(m.monthlyInterest) : '',
           num(loan.property_value), loan.property_value ? money(m.equity) : '', m.ltv === null ? '' : csvPct(m.ltv),
@@ -229,7 +258,7 @@ export default function DebtEquityPage() {
       })
     })
     rows.push([
-      'Portfolio', `${loans.length} loan${loans.length !== 1 ? 's' : ''}`, '', money(portfolioDebt), '', money(portfolioMonthlyService),
+      'Portfolio', `${loans.length} loan${loans.length !== 1 ? 's' : ''}`, '', money(portfolioDebt), '', '', '', '', money(portfolioMonthlyService),
       '', '', money(portfolioValue), money(portfolioEquity), portfolioLTV === null ? '' : csvPct(portfolioLTV),
       money(portfolioMonthlyService * 12), '', '', '',
     ])
@@ -287,8 +316,8 @@ export default function DebtEquityPage() {
         const coAnnualDebt = coLoans.reduce((s, l) => s + (parseFloat(l.monthly_payment) || 0) * 12, 0)
         const dscr = coAnnualDebt > 0 ? annualNOI / coAnnualDebt : null
         const coActualService = actualLoanService(company.id)
-        const coEquity = coLoans.reduce((s, l) => s + ((parseFloat(l.property_value) || 0) - (parseFloat(l.current_balance) || 0)), 0)
-        const coDebt = coLoans.reduce((s, l) => s + (parseFloat(l.current_balance) || 0), 0)
+        const coEquity = coLoans.reduce((s, l) => s + ((parseFloat(l.property_value) || 0) - balanceOf(l).balance), 0)
+        const coDebt = coLoans.reduce((s, l) => s + balanceOf(l).balance, 0)
 
         return (
           <div key={company.id} className="bg-white rounded-xl border border-slate-200 overflow-hidden mb-5">
@@ -357,8 +386,29 @@ export default function DebtEquityPage() {
                           <td className="px-4 py-3 text-right font-mono text-xs text-slate-500">
                             {loan.original_balance ? fmt(parseFloat(loan.original_balance)) : '—'}
                           </td>
-                          <td className="px-4 py-3 text-right font-mono text-xs font-semibold text-slate-900">
-                            {fmt(parseFloat(loan.current_balance) || 0)}
+                          <td className="px-4 py-3 text-right font-mono text-xs font-semibold text-slate-900 align-top">
+                            {(() => {
+                              const b = balanceOf(loan)
+                              return (
+                                <>
+                                  {fmt(b.balance)}
+                                  {b.status === 'ok' && (
+                                    <p className="font-sans font-normal text-[11px] text-slate-400 mt-0.5 whitespace-nowrap">
+                                      {fmt(b.statement)} on {b.asOf}
+                                      {b.principalSince ? ` − ${fmt(b.principalSince)} principal since` : ', no principal since'}
+                                    </p>
+                                  )}
+                                  {b.status === 'no_date' && (
+                                    <button onClick={() => openEdit(loan)} className="block ml-auto font-sans font-normal text-[11px] text-amber-700 underline mt-0.5 whitespace-nowrap">
+                                      Add statement date to update
+                                    </button>
+                                  )}
+                                  {b.status === 'multi_loan' && (
+                                    <p className="font-sans font-normal text-[11px] text-slate-400 mt-0.5 whitespace-nowrap">As of statement (2+ loans; not rolled forward)</p>
+                                  )}
+                                </>
+                              )
+                            })()}
                           </td>
                           <td className="px-4 py-3 text-right font-mono text-xs text-slate-600">
                             {loan.interest_rate ? `${parseFloat(loan.interest_rate).toFixed(3)}%` : '—'}
@@ -425,6 +475,22 @@ export default function DebtEquityPage() {
                   )}
                 </table>
 
+                {/* Recorded vs expected principal since the statement */}
+                {coLoans.map(loan => {
+                  const b = balanceOf(loan)
+                  if (b.status !== 'ok' || b.expectedPrincipal === null || b.months === 0) return null
+                  return (
+                    <div key={`chk-${loan.id}`} className={`px-5 py-2.5 border-t border-slate-100 flex flex-wrap items-center gap-x-6 gap-y-1 text-xs ${b.flag ? 'bg-amber-50 text-amber-800' : 'bg-slate-50/40 text-slate-500'}`}>
+                      <span className="font-semibold">Principal since {b.asOf}{coLoans.length > 1 ? ` (${loan.lender_name})` : ''}</span>
+                      <span>Recorded <span className="font-mono font-semibold">{fmt(b.principalSince)}</span> in {b.payments} payment{b.payments !== 1 ? 's' : ''}</span>
+                      <span>Expected <span className="font-mono">{fmt(b.expectedPrincipal)}</span> over {b.months} month{b.months !== 1 ? 's' : ''}</span>
+                      {b.flag
+                        ? <span>Off by {fmt(Math.abs(b.gap))}: check for a missed payment or a payment split wrongly between interest and principal.</span>
+                        : <span className="text-emerald-700">In line with the amortization</span>}
+                    </div>
+                  )
+                })}
+
                 {/* Actual vs. Scheduled loan service */}
                 {coActualService !== null && (
                   <div className="px-5 py-3 border-t border-slate-100 bg-slate-50/40 flex items-center gap-6 text-xs text-slate-500">
@@ -478,12 +544,23 @@ export default function DebtEquityPage() {
                     className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-slate-900" />
                 </div>
                 <div>
-                  <label className="block text-xs font-medium text-slate-600 mb-1">Current Balance</label>
+                  <label className="block text-xs font-medium text-slate-600 mb-1">Statement Balance</label>
                   <input type="number" step="0.01" value={form.current_balance}
                     onChange={e => setForm(f => ({ ...f, current_balance: e.target.value }))}
                     placeholder="0.00"
                     className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-slate-900" />
                 </div>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-slate-600 mb-1">Balance As Of</label>
+                  <input type="date" value={form.balance_as_of}
+                    onChange={e => setForm(f => ({ ...f, balance_as_of: e.target.value }))}
+                    className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-900" />
+                </div>
+                <p className="text-xs text-slate-400 self-end pb-1">
+                  The lender statement date for that balance (for a new loan, its funding date). Principal payments recorded after it reduce the balance automatically.
+                </p>
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <div>
@@ -554,8 +631,9 @@ export default function DebtEquityPage() {
                 </div>
               )}
             </div>
+            {saveError && <p className="text-xs text-red-600 mt-3">{saveError}</p>}
             <div className="flex gap-3 mt-5">
-              <button onClick={() => { setShowModal(false); setEditingLoan(null); setForm(EMPTY_LOAN) }}
+              <button onClick={() => { setShowModal(false); setEditingLoan(null); setForm(EMPTY_LOAN); setSaveError('') }}
                 className="flex-1 px-4 py-2 text-sm border border-slate-200 rounded-lg text-slate-600 hover:bg-slate-50">
                 Cancel
               </button>
